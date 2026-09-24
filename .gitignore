@@ -1,0 +1,13 @@
+# 依赖与构建产物
+node_modules/
+frontend/dist/
+
+# IDE / 工具数据
+.codebuddy/
+.vscode/
+.idea/
+
+# 运行时与临时文件
+*.log
+.env
+.env.*

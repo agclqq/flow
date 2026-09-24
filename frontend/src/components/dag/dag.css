@@ -1,0 +1,5 @@
+/* 边上的操作按钮渲染在 edgelabel-renderer 层，该层默认无 z-index
+   且位于节点层之前，会被节点遮挡；提升到节点与悬停边（zIndex 1005）之上。 */
+.react-flow__edgelabel-renderer {
+  z-index: 1006;
+}
