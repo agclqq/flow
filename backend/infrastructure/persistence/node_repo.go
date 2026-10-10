@@ -81,6 +81,18 @@ func toNodeModel(node *entity.Node) *NodeModel {
 	approversJSON, _ := json.Marshal(node.Approvers)
 	requiredPredJSON, _ := json.Marshal(node.RequiredPredecessorIDs)
 	requiredEdgesJSON, _ := json.Marshal(node.RequiredEdgeIDs)
+	k8sVolumesJSON, _ := json.Marshal(node.K8sVolumes)
+	k8sMountsJSON, _ := json.Marshal(node.K8sVolumeMounts)
+	k8sResourcesJSON, _ := json.Marshal(node.K8sResources)
+	if node.K8sVolumes == nil {
+		k8sVolumesJSON = []byte("[]")
+	}
+	if node.K8sVolumeMounts == nil {
+		k8sMountsJSON = []byte("[]")
+	}
+	if node.K8sResources.IsEmpty() {
+		k8sResourcesJSON = []byte("{}")
+	}
 	return &NodeModel{
 		ID:                     node.ID,
 		TemplateID:             node.TemplateID,
@@ -105,6 +117,12 @@ func toNodeModel(node *entity.Node) *NodeModel {
 		PositionY:              node.PositionY,
 		RuntimeKind:            node.RuntimeKind,
 		ResourceID:             node.ResourceID,
+		K8sAuthID:              node.K8sAuthID,
+		K8sNamespace:           node.K8sNamespace,
+		K8sImage:               node.K8sImage,
+		K8sVolumes:             string(k8sVolumesJSON),
+		K8sVolumeMounts:        string(k8sMountsJSON),
+		K8sResources:           string(k8sResourcesJSON),
 	}
 }
 
@@ -137,6 +155,30 @@ func toNodeEntity(m *NodeModel) *entity.Node {
 	if requiredEdgeIDs == nil {
 		requiredEdgeIDs = []int64{}
 	}
+	var k8sVolumes []entity.K8sVolume
+	if m.K8sVolumes != "" {
+		_ = json.Unmarshal([]byte(m.K8sVolumes), &k8sVolumes)
+	}
+	if k8sVolumes == nil {
+		k8sVolumes = []entity.K8sVolume{}
+	}
+	var k8sMounts []entity.K8sVolumeMount
+	if m.K8sVolumeMounts != "" {
+		_ = json.Unmarshal([]byte(m.K8sVolumeMounts), &k8sMounts)
+	}
+	if k8sMounts == nil {
+		k8sMounts = []entity.K8sVolumeMount{}
+	}
+	var k8sResources entity.K8sResourceRequirements
+	if m.K8sResources != "" && m.K8sResources != "{}" {
+		_ = json.Unmarshal([]byte(m.K8sResources), &k8sResources)
+	}
+	if k8sResources.Requests == nil {
+		k8sResources.Requests = map[string]string{}
+	}
+	if k8sResources.Limits == nil {
+		k8sResources.Limits = map[string]string{}
+	}
 	return &entity.Node{
 		ID:                     m.ID,
 		TemplateID:             m.TemplateID,
@@ -161,5 +203,11 @@ func toNodeEntity(m *NodeModel) *entity.Node {
 		PositionY:              m.PositionY,
 		RuntimeKind:            m.RuntimeKind,
 		ResourceID:             m.ResourceID,
+		K8sAuthID:              m.K8sAuthID,
+		K8sNamespace:           m.K8sNamespace,
+		K8sImage:               m.K8sImage,
+		K8sVolumes:             k8sVolumes,
+		K8sVolumeMounts:        k8sMounts,
+		K8sResources:           k8sResources,
 	}
 }

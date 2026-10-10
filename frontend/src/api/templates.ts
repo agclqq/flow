@@ -195,13 +195,14 @@ export async function saveDraftConfig(
     owners: values.owners ?? [],
   })
   await syncParams(templateId, versionId, existingParams, values.params ?? [])
+  const existing = await getTrigger(templateId)
   await upsertTrigger(templateId, {
-    manual: values.manual ?? false,
-    webhook: values.webhook ?? false,
-    cron: values.cron ?? false,
-    cron_expr: values.cron_expr ?? '',
-    require_params: values.require_params ?? false,
-    webhook_secret: values.webhook_secret ?? '',
+    manual: values.manual ?? existing?.manual ?? true,
+    webhook: values.webhook ?? existing?.webhook ?? false,
+    cron: values.cron ?? existing?.cron ?? false,
+    cron_expr: values.cron_expr ?? existing?.cron_expr ?? '',
+    require_params: values.require_params ?? existing?.require_params ?? false,
+    webhook_secret: values.webhook_secret ?? existing?.webhook_secret ?? '',
   })
 }
 
@@ -247,11 +248,24 @@ export async function putGraph(
     }
   }
 
+  const resolvePredecessorRef = (predId: number) => {
+    const viaBackend = refByBackend.get(predId)
+    if (viaBackend != null) {
+      return viaBackend
+    }
+    for (const node of graph.nodes) {
+      const ref = refByClient.get(node.clientId)
+      if (ref == null) continue
+      if (node.backendId === predId || ref === predId) {
+        return ref
+      }
+    }
+    return predId
+  }
+
   for (const payload of nodePayloads) {
     if (!payload.required_predecessor_ids?.length) continue
-    payload.required_predecessor_ids = payload.required_predecessor_ids.map(
-      (predId) => refByBackend.get(predId) ?? predId,
-    )
+    payload.required_predecessor_ids = payload.required_predecessor_ids.map(resolvePredecessorRef)
   }
 
   const edgePayloads = graph.edges.map((edge) => {

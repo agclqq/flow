@@ -16,5 +16,7 @@ type FlowTemplateVersionRepository interface {
 	GetLatestPublishedByTemplate(ctx context.Context, templateID int64) (*entity.FlowTemplateVersion, error)
 	// ListByTemplate 查询某个模板下的所有版本。
 	ListByTemplate(ctx context.Context, templateID int64) ([]*entity.FlowTemplateVersion, error)
+	// ListPublishedCronTriggers 返回各模板最新已发布版本中开启 cron 的规则。
+	ListPublishedCronTriggers(ctx context.Context) ([]entity.PublishedCronRule, error)
 	Update(ctx context.Context, ver *entity.FlowTemplateVersion) error
 }

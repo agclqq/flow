@@ -1,11 +1,11 @@
 import {
-  BranchesOutlined,
   CodeOutlined,
   FlagOutlined,
   PlayCircleOutlined,
   UserOutlined,
 } from '@ant-design/icons'
-import { Alert, Button, Card, Drawer, Form, Input, Modal, Select, Space, Spin, Typography, message } from 'antd'
+import { FullscreenOutlined, MinusCircleOutlined, PlusOutlined } from '@ant-design/icons'
+import { Alert, Button, Card, Drawer, Form, Input, Modal, Select, Space, Spin, Switch, Typography, message } from 'antd'
 import {
   Background,
   Controls,
@@ -33,12 +33,24 @@ import {
   useRef,
   useState,
 } from 'react'
-import type { ExecutorResource, FlowNode as BackendFlowNode, NodeInstance, RuntimeKind, StartMode } from '../../api/types'
-import { createExecutorResource, listExecutorResources } from '../../api/executor-resources'
+import type {
+  ExecutorResource,
+  FlowNode as BackendFlowNode,
+  K8sConfig,
+  K8sResources,
+  NodeInstance,
+  NodeInstanceStatus,
+  RuntimeKind,
+  StartMode,
+} from '../../api/types'
+import { nodeStatusLabel } from '../../utils/format'
+import { listExecutorResources } from '../../api/executor-resources'
+import { listK8sConfigs } from '../../api/k8s-configs'
 import { listNodes, putGraph } from '../../api/templates'
 import { DagNodeContext } from './dagNodeContext'
 import { flowEdgeTypes } from './FlowEdge'
 import { flowNodeTypes } from './FlowNode'
+import K8sAuthModal from './K8sAuthModal'
 import ResourceModal from './ResourceModal'
 import {
   buildNodeStatusMap,
@@ -50,6 +62,9 @@ import {
   mergeBackendIdsAfterTopologySave,
   nextTempId,
   nodeBorderColor,
+  formFieldsToK8sResources,
+  k8sResourcesToFormFields,
+  K8S_GPU_RESOURCE,
 } from './dagUtils'
 
 const ScriptEditor = lazy(() => import('./ScriptEditor'))
@@ -65,6 +80,81 @@ function LazyScriptEditor(props: {
     <Suspense fallback={<Spin size="small" />}>
       <ScriptEditor {...props} />
     </Suspense>
+  )
+}
+
+function ScriptFormEditor({
+  value,
+  onChange,
+  readOnly,
+  height = 160,
+  paramNames,
+  label,
+}: {
+  value?: string
+  onChange?: (value: string) => void
+  readOnly?: boolean
+  height?: number
+  paramNames?: string[]
+  label: string
+}) {
+  const [open, setOpen] = useState(false)
+  const [fullscreenHeight, setFullscreenHeight] = useState(600)
+
+  const openFullscreen = () => {
+    setFullscreenHeight(Math.max(400, window.innerHeight - 120))
+    setOpen(true)
+  }
+
+  const closeFullscreen = () => setOpen(false)
+
+  return (
+    <>
+      <div
+        style={{
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          marginBottom: 8,
+        }}
+      >
+        <span style={{ color: 'rgba(0, 0, 0, 0.88)', fontSize: 14, lineHeight: '22px' }}>{label}</span>
+        <Button
+          type="link"
+          size="small"
+          icon={<FullscreenOutlined />}
+          aria-label={`全屏编辑 ${label}`}
+          onClick={openFullscreen}
+        >
+          全屏
+        </Button>
+      </div>
+      <LazyScriptEditor
+        value={value}
+        onChange={onChange}
+        readOnly={readOnly}
+        height={height}
+        paramNames={paramNames}
+      />
+      <Modal
+        title={label}
+        open={open}
+        footer={null}
+        onCancel={closeFullscreen}
+        width="100%"
+        style={{ top: 8, paddingBottom: 0, maxWidth: '100vw' }}
+        styles={{ body: { height: fullscreenHeight, padding: 8 } }}
+        destroyOnHidden
+      >
+        <LazyScriptEditor
+          value={value}
+          onChange={onChange}
+          readOnly={readOnly}
+          height={fullscreenHeight - 24}
+          paramNames={paramNames}
+        />
+      </Modal>
+    </>
   )
 }
 
@@ -97,6 +187,20 @@ const buildNodeData = (nodeType: string): Record<string, unknown> => {
   }
 }
 
+function splitK8sImage(image?: string) {
+  if (!image) return { repository: '', tag: 'latest' }
+  const idx = image.lastIndexOf(':')
+  if (idx <= 0) return { repository: image, tag: 'latest' }
+  return { repository: image.slice(0, idx), tag: image.slice(idx + 1) }
+}
+
+function joinK8sImage(repository?: string, tag?: string) {
+  const repo = (repository ?? '').trim()
+  const t = (tag ?? '').trim() || 'latest'
+  if (!repo) return ''
+  return `${repo}:${t}`
+}
+
 const START_MODE_OPTIONS = [
   { value: 'any', label: '任一前驱完成 (any)' },
   { value: 'all', label: '所有前驱完成 (all)' },
@@ -108,7 +212,7 @@ type DagEditorProps = {
   versionId?: number
   editable?: boolean
   readOnly?: boolean
-  /** 当前版本是否可写（已发布版本为 false：跳过自动保存，改动随「保存」写入新草稿） */
+  /** 当前版本是否可写（已发布版本为 false 时跳过自动保存） */
   writable?: boolean
   paramNames?: string[]
   nodeInstances?: NodeInstance[]
@@ -150,7 +254,9 @@ const DagEditorInner = forwardRef<DagEditorHandle, DagEditorProps>(function DagE
   const [selectedNode, setSelectedNode] = useState<Node | null>(null)
   const [selectedNodeInstance, setSelectedNodeInstance] = useState<NodeInstance | null>(null)
   const [executorResources, setExecutorResources] = useState<ExecutorResource[]>([])
+  const [k8sAuthConfigs, setK8sAuthConfigs] = useState<K8sConfig[]>([])
   const [resourceModalOpen, setResourceModalOpen] = useState(false)
+  const [k8sAuthModalOpen, setK8sAuthModalOpen] = useState(false)
   const [, setBackendNodes] = useState<BackendFlowNode[]>([])
   const [loading, setLoading] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
@@ -166,12 +272,14 @@ const DagEditorInner = forwardRef<DagEditorHandle, DagEditorProps>(function DagE
   const flowWrapperRef = useRef<HTMLDivElement | null>(null)
   const topologySaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const topologySavingRef = useRef(false)
+  const persistContextWarnedRef = useRef(false)
   nodesRef.current = nodes
   edgesRef.current = edges
-  // 画布高度填满当前窗口剩余空间（仅编辑模式自适应，只读画布保持固定高度）。
+  // 画布高度填满当前窗口剩余空间（编辑页 / 实例只读视图）。
   const [flowHeight, setFlowHeight] = useState(520)
+  const autoFlowHeight = editable || readOnly
   useEffect(() => {
-    if (!editable) return
+    if (!autoFlowHeight) return
     const measure = () => {
       const el = flowWrapperRef.current
       if (!el) return
@@ -186,7 +294,7 @@ const DagEditorInner = forwardRef<DagEditorHandle, DagEditorProps>(function DagE
       window.removeEventListener('resize', measure)
       observer.disconnect()
     }
-  }, [editable, saveError])
+  }, [autoFlowHeight, saveError])
   const [nodeForm] = Form.useForm()
   const startMode = Form.useWatch('start_mode', nodeForm) as StartMode | undefined
   const runtimeKind = (Form.useWatch('runtime_kind', nodeForm) ?? 'local') as RuntimeKind | string
@@ -364,9 +472,23 @@ const DagEditorInner = forwardRef<DagEditorHandle, DagEditorProps>(function DagE
     return () => window.removeEventListener('mousedown', onMouseDown, true)
   }, [pendingAdd?.pos])
 
+  const requirePersistContext = useCallback((): boolean => {
+    if (templateId && versionId) {
+      return true
+    }
+    if (!persistContextWarnedRef.current) {
+      persistContextWarnedRef.current = true
+      message.warning('请先在「配置信息」填写模板名称，创建模板后再编排')
+      window.setTimeout(() => {
+        persistContextWarnedRef.current = false
+      }, 3000)
+    }
+    return false
+  }, [templateId, versionId])
+
   const persistTopology = useCallback(
     async (targetVersionId: number) => {
-      if (!templateId || readOnly || !editable || !writable) return
+      if (!requirePersistContext() || readOnly || !editable || !writable) return
       if (topologySavingRef.current) return
       topologySavingRef.current = true
       try {
@@ -383,18 +505,18 @@ const DagEditorInner = forwardRef<DagEditorHandle, DagEditorProps>(function DagE
         topologySavingRef.current = false
       }
     },
-    [editable, readOnly, setEdges, setNodes, templateId, writable],
+    [editable, readOnly, requirePersistContext, setEdges, setNodes, writable],
   )
 
   const scheduleTopologySave = useCallback(() => {
-    if (!versionId || readOnly || !editable || !writable) return
+    if (!requirePersistContext() || readOnly || !editable || !writable) return
     if (topologySaveTimerRef.current) {
       clearTimeout(topologySaveTimerRef.current)
     }
     topologySaveTimerRef.current = setTimeout(() => {
       void persistTopology(versionId)
     }, 800)
-  }, [editable, persistTopology, readOnly, versionId, writable])
+  }, [editable, persistTopology, readOnly, requirePersistContext, versionId, writable])
 
   const onConnect = useCallback(
     (connection: Connection) => {
@@ -634,9 +756,16 @@ const DagEditorInner = forwardRef<DagEditorHandle, DagEditorProps>(function DagE
         return
       }
       setSelectedNode(node)
-      void listExecutorResources()
-        .then(setExecutorResources)
-        .catch(() => setExecutorResources([]))
+      void Promise.all([listExecutorResources(), listK8sConfigs()])
+        .then(([resources, k8sConfigs]) => {
+          setExecutorResources(resources)
+          setK8sAuthConfigs(k8sConfigs)
+        })
+        .catch(() => {
+          setExecutorResources([])
+          setK8sAuthConfigs([])
+        })
+      const imageParts = splitK8sImage(String(node.data.k8s_image ?? ''))
       nodeForm.setFieldsValue({
         name: node.data.label,
         description: node.data.description ?? '',
@@ -649,6 +778,13 @@ const DagEditorInner = forwardRef<DagEditorHandle, DagEditorProps>(function DagE
         required_predecessor_ids: node.data.required_predecessor_ids ?? [],
         runtime_kind: node.data.runtime_kind ?? 'local',
         resource_id: node.data.resource_id || undefined,
+        k8s_auth_id: node.data.k8s_auth_id || undefined,
+        k8s_namespace: node.data.k8s_namespace ?? '',
+        k8s_image_repository: imageParts.repository,
+        k8s_image_tag: imageParts.tag,
+        k8s_volumes: node.data.k8s_volumes ?? [],
+        k8s_volume_mounts: node.data.k8s_volume_mounts ?? [],
+        ...k8sResourcesToFormFields(node.data.k8s_resources as K8sResources | undefined),
       })
       if (backendId && statusMap.has(backendId)) {
         const instance = statusMap.get(backendId)!
@@ -760,6 +896,12 @@ const DagEditorInner = forwardRef<DagEditorHandle, DagEditorProps>(function DagE
                   required_predecessor_ids: values.required_predecessor_ids ?? [],
                   runtime_kind: values.runtime_kind ?? 'local',
                   resource_id: values.resource_id ?? 0,
+                  k8s_auth_id: values.k8s_auth_id ?? 0,
+                  k8s_namespace: values.k8s_namespace ?? '',
+                  k8s_image: joinK8sImage(values.k8s_image_repository, values.k8s_image_tag),
+                  k8s_volumes: values.k8s_volumes ?? [],
+                  k8s_volume_mounts: values.k8s_volume_mounts ?? [],
+                  k8s_resources: formFieldsToK8sResources(values),
                 },
               }
             : node,
@@ -819,7 +961,15 @@ const DagEditorInner = forwardRef<DagEditorHandle, DagEditorProps>(function DagE
     selectedNode?.data.nodeType === 'task' || selectedNode?.data.nodeType === 'manual'
 
   return (
-    <div style={{ display: 'grid', gridTemplateColumns: editable ? '220px 1fr' : '1fr', gap: 16 }}>
+    <div
+      style={{
+        display: 'grid',
+        gridTemplateColumns: editable ? '220px 1fr' : '1fr',
+        gap: 16,
+        height: readOnly ? '100%' : undefined,
+        minHeight: readOnly ? 0 : undefined,
+      }}
+    >
       {editable && (
         <Card title="节点类型" size="small">
           <Space orientation="vertical" size={8} style={{ width: '100%' }}>
@@ -994,13 +1144,15 @@ const DagEditorInner = forwardRef<DagEditorHandle, DagEditorProps>(function DagE
         title={selectedNode ? `节点：${selectedNode.data.label ?? selectedNode.id}` : '节点详情'}
         open={!!selectedNode}
         onClose={() => setSelectedNode(null)}
-        size={560}
-        extra={
-          !readOnly && (
-            <Button type="primary" onClick={() => void saveNodeForm()}>
-              确定
-            </Button>
-          )
+        size={720}
+        footer={
+          !readOnly ? (
+            <div style={{ display: 'flex', justifyContent: 'center' }}>
+              <Button type="primary" onClick={() => void saveNodeForm()}>
+                保存
+              </Button>
+            </div>
+          ) : null
         }
       >
         {selectedNode && (
@@ -1021,6 +1173,32 @@ const DagEditorInner = forwardRef<DagEditorHandle, DagEditorProps>(function DagE
               <Form.Item label="负责人" name="owners" rules={[{ required: !readOnly, message: '请设置负责人' }]}>
                 <Select mode="tags" placeholder="选择或输入负责人" />
               </Form.Item>
+              {isExecutableNode && (
+                <>
+                  <Form.Item label="启动策略" name="start_mode">
+                    <Select options={START_MODE_OPTIONS} />
+                  </Form.Item>
+                  {startMode === 'custom' && (
+                    <>
+                      <Form.Item label="必须完成的前驱节点" name="required_predecessor_ids">
+                        <Select
+                          mode="multiple"
+                          options={predecessorOptions}
+                          placeholder="选择前驱节点"
+                          allowClear
+                        />
+                      </Form.Item>
+                      <Form.Item
+                        label="启动脚本 (start_script)"
+                        name="start_script"
+                        extra="exit 0 才启动；非 0 则跳过该节点"
+                      >
+                        <LazyScriptEditor readOnly={readOnly} paramNames={paramNames} height={160} />
+                      </Form.Item>
+                    </>
+                  )}
+                </>
+              )}
               {isExecutableNode && !readOnly && (
                 <>
                   <Form.Item label="资源类型" name="runtime_kind" initialValue="local">
@@ -1033,64 +1211,213 @@ const DagEditorInner = forwardRef<DagEditorHandle, DagEditorProps>(function DagE
                       onChange={() => nodeForm.setFieldValue('resource_id', undefined)}
                     />
                   </Form.Item>
-                  {runtimeKind !== 'local' && (
+                  {runtimeKind === 'ssh' && (
                     <>
                       <Form.Item
-                        label="执行资源"
+                        label="SSH 执行资源"
                         name="resource_id"
-                        rules={[{ required: true, message: '请选择执行资源' }]}
+                        rules={[{ required: true, message: '请选择 SSH 资源' }]}
                       >
                         <Select
-                          placeholder="选择执行资源"
+                          placeholder="选择 SSH 资源"
                           allowClear
                           options={executorResources
-                            .filter((item) => item.type === runtimeKind)
+                            .filter((item) => item.type === 'ssh')
                             .map((item) => ({ value: item.id, label: item.name }))}
                         />
                       </Form.Item>
                       <Form.Item>
                         <Button size="small" onClick={() => setResourceModalOpen(true)}>
-                          新建{runtimeKind === 'ssh' ? ' SSH' : ' K8s'}资源
+                          新建 SSH 资源
                         </Button>
                       </Form.Item>
                     </>
                   )}
-                </>
-              )}
-              {isExecutableNode && (
-                <>
-                  <Form.Item label="启动策略" name="start_mode">
-                    <Select options={START_MODE_OPTIONS} />
-                  </Form.Item>
-                  {startMode === 'custom' && (
+                  {runtimeKind === 'k8s' && (
                     <>
                       <Form.Item
-                        label="启动脚本 (start_script)"
-                        name="start_script"
-                        extra="exit 0 才启动；非 0 则跳过该节点"
+                        label="K8s 认证"
+                        name="k8s_auth_id"
+                        rules={[{ required: true, message: '请选择 K8s 认证' }]}
                       >
-                        <LazyScriptEditor readOnly={readOnly} paramNames={paramNames} height={160} />
-                      </Form.Item>
-                      <Form.Item label="必须完成的前驱节点" name="required_predecessor_ids">
                         <Select
-                          mode="multiple"
-                          options={predecessorOptions}
-                          placeholder="选择前驱节点"
+                          placeholder="选择集群认证"
                           allowClear
+                          options={k8sAuthConfigs.map((item) => ({ value: item.id, label: item.name }))}
                         />
                       </Form.Item>
+                      <Form.Item>
+                        <Button size="small" onClick={() => setK8sAuthModalOpen(true)}>
+                          新建 K8s 认证
+                        </Button>
+                      </Form.Item>
+                      <Form.Item label="命名空间（可选覆盖）" name="k8s_namespace">
+                        <Input placeholder="留空则使用认证配置中的默认命名空间" />
+                      </Form.Item>
+                      <Form.Item label="镜像仓库" name="k8s_image_repository" rules={[{ required: true, message: '请输入镜像地址' }]}>
+                        <Input placeholder="例如：registry.example.com/flow/runner" />
+                      </Form.Item>
+                      <Form.Item label="镜像版本" name="k8s_image_tag" initialValue="latest">
+                        <Input placeholder="例如：1.0.0 或 latest" />
+                      </Form.Item>
+                      <Typography.Text type="secondary" style={{ display: 'block', marginTop: 8 }}>
+                        资源 requests / limits
+                      </Typography.Text>
+                      <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                        CPU / 内存使用 K8s 数量格式（如 500m、2、512Mi、2Gi）；GPU 对应 {K8S_GPU_RESOURCE}
+                      </Typography.Text>
+                      <div style={{ display: 'flex', gap: 16, marginTop: 8 }}>
+                        <Form.Item label="CPU request" name="k8s_cpu_request" style={{ flex: 1, marginBottom: 8 }}>
+                          <Input placeholder="500m" />
+                        </Form.Item>
+                        <Form.Item label="CPU limit" name="k8s_cpu_limit" style={{ flex: 1, marginBottom: 8 }}>
+                          <Input placeholder="2" />
+                        </Form.Item>
+                      </div>
+                      <div style={{ display: 'flex', gap: 16 }}>
+                        <Form.Item label="内存 request" name="k8s_mem_request" style={{ flex: 1, marginBottom: 8 }}>
+                          <Input placeholder="512Mi" />
+                        </Form.Item>
+                        <Form.Item label="内存 limit" name="k8s_mem_limit" style={{ flex: 1, marginBottom: 8 }}>
+                          <Input placeholder="2Gi" />
+                        </Form.Item>
+                      </div>
+                      <div style={{ display: 'flex', gap: 16 }}>
+                        <Form.Item label="GPU request" name="k8s_gpu_request" style={{ flex: 1, marginBottom: 8 }}>
+                          <Input placeholder="1" />
+                        </Form.Item>
+                        <Form.Item label="GPU limit" name="k8s_gpu_limit" style={{ flex: 1, marginBottom: 8 }}>
+                          <Input placeholder="1" />
+                        </Form.Item>
+                      </div>
+                      <Form.List name="k8s_extra_resources">
+                        {(fields, { add, remove }) => (
+                          <>
+                            {fields.map((field) => (
+                              <Space key={field.key} align="baseline" style={{ display: 'flex', marginBottom: 8, flexWrap: 'wrap' }}>
+                                <Form.Item {...field} name={[field.name, 'name']} rules={[{ required: true, message: '资源名' }]}>
+                                  <Input placeholder="如 amd.com/gpu" style={{ width: 160 }} />
+                                </Form.Item>
+                                <Form.Item {...field} name={[field.name, 'request']}>
+                                  <Input placeholder="request" style={{ width: 90 }} />
+                                </Form.Item>
+                                <Form.Item {...field} name={[field.name, 'limit']}>
+                                  <Input placeholder="limit" style={{ width: 90 }} />
+                                </Form.Item>
+                                <MinusCircleOutlined onClick={() => remove(field.name)} />
+                              </Space>
+                            ))}
+                            <Button type="dashed" onClick={() => add()} block icon={<PlusOutlined />} style={{ marginBottom: 12 }}>
+                              添加其他资源
+                            </Button>
+                          </>
+                        )}
+                      </Form.List>
+                      <Typography.Text type="secondary">卷定义</Typography.Text>
+                      <Form.List name="k8s_volumes">
+                        {(fields, { add, remove }) => (
+                          <>
+                            {fields.map((field) => (
+                              <Space key={field.key} align="baseline" style={{ display: 'flex', marginBottom: 8 }}>
+                                <Form.Item {...field} name={[field.name, 'name']} rules={[{ required: true, message: '名称' }]}>
+                                  <Input placeholder="卷名" />
+                                </Form.Item>
+                                <Form.Item {...field} name={[field.name, 'type']} initialValue="emptyDir">
+                                  <Select
+                                    style={{ width: 120 }}
+                                    options={[
+                                      { value: 'emptyDir', label: 'emptyDir' },
+                                      { value: 'hostPath', label: 'hostPath' },
+                                      { value: 'configMap', label: 'configMap' },
+                                      { value: 'secret', label: 'secret' },
+                                      { value: 'pvc', label: 'PVC' },
+                                    ]}
+                                  />
+                                </Form.Item>
+                                <Form.Item {...field} name={[field.name, 'source']}>
+                                  <Input placeholder="来源（hostPath/CM/Secret/PVC 名）" style={{ width: 200 }} />
+                                </Form.Item>
+                                <MinusCircleOutlined onClick={() => remove(field.name)} />
+                              </Space>
+                            ))}
+                            <Button type="dashed" onClick={() => add()} block icon={<PlusOutlined />}>
+                              添加卷
+                            </Button>
+                          </>
+                        )}
+                      </Form.List>
+                      <Typography.Text type="secondary" style={{ display: 'block', marginTop: 12 }}>
+                        挂载
+                      </Typography.Text>
+                      <Form.List name="k8s_volume_mounts">
+                        {(fields, { add, remove }) => (
+                          <>
+                            {fields.map((field) => (
+                              <div
+                                key={field.key}
+                                style={{
+                                  display: 'flex',
+                                  gap: 8,
+                                  alignItems: 'flex-start',
+                                  marginBottom: 8,
+                                  width: '100%',
+                                }}
+                              >
+                                <Form.Item
+                                  {...field}
+                                  name={[field.name, 'name']}
+                                  rules={[{ required: true, message: '卷名' }]}
+                                  style={{ flex: '0 0 96px', marginBottom: 0 }}
+                                >
+                                  <Input placeholder="卷名" />
+                                </Form.Item>
+                                <Form.Item
+                                  {...field}
+                                  name={[field.name, 'mount_path']}
+                                  rules={[{ required: true, message: '路径' }]}
+                                  style={{ flex: 1, minWidth: 0, marginBottom: 0 }}
+                                >
+                                  <Input placeholder="挂载路径" />
+                                </Form.Item>
+                                <Form.Item
+                                  {...field}
+                                  name={[field.name, 'sub_path']}
+                                  style={{ flex: '0 0 88px', marginBottom: 0 }}
+                                >
+                                  <Input placeholder="subPath" />
+                                </Form.Item>
+                                <Form.Item
+                                  {...field}
+                                  name={[field.name, 'read_only']}
+                                  valuePropName="checked"
+                                  style={{ flex: '0 0 auto', marginBottom: 0 }}
+                                >
+                                  <Switch checkedChildren="只读" unCheckedChildren="读写" />
+                                </Form.Item>
+                                <MinusCircleOutlined
+                                  style={{ marginTop: 8, flexShrink: 0 }}
+                                  onClick={() => remove(field.name)}
+                                />
+                              </div>
+                            ))}
+                            <Button type="dashed" onClick={() => add()} block icon={<PlusOutlined />}>
+                              添加挂载
+                            </Button>
+                          </>
+                        )}
+                      </Form.List>
                     </>
                   )}
                 </>
               )}
-              <Form.Item label="pre_script" name="pre_script">
-                <LazyScriptEditor readOnly={readOnly} paramNames={paramNames} />
+              <Form.Item name="pre_script" style={{ marginTop: 24 }}>
+                <ScriptFormEditor readOnly={readOnly} paramNames={paramNames} label="pre_script" />
               </Form.Item>
-              <Form.Item label="script" name="script">
-                <LazyScriptEditor readOnly={readOnly} paramNames={paramNames} height={200} />
+              <Form.Item name="script">
+                <ScriptFormEditor readOnly={readOnly} paramNames={paramNames} height={200} label="script" />
               </Form.Item>
-              <Form.Item label="post_script" name="post_script">
-                <LazyScriptEditor readOnly={readOnly} paramNames={paramNames} />
+              <Form.Item name="post_script">
+                <ScriptFormEditor readOnly={readOnly} paramNames={paramNames} label="post_script" />
               </Form.Item>
             </Form>
           </>
@@ -1099,12 +1426,21 @@ const DagEditorInner = forwardRef<DagEditorHandle, DagEditorProps>(function DagE
 
       <ResourceModal
         open={resourceModalOpen}
-        type={runtimeKind}
+        type="ssh"
         onClose={() => setResourceModalOpen(false)}
         onCreated={(resource) => {
           setExecutorResources((current) => [resource, ...current])
           nodeForm.setFieldValue('resource_id', resource.id)
           setResourceModalOpen(false)
+        }}
+      />
+      <K8sAuthModal
+        open={k8sAuthModalOpen}
+        onClose={() => setK8sAuthModalOpen(false)}
+        onCreated={(config) => {
+          setK8sAuthConfigs((current) => [config, ...current])
+          nodeForm.setFieldValue('k8s_auth_id', config.id)
+          setK8sAuthModalOpen(false)
         }}
       />
     </div>
@@ -1121,27 +1457,24 @@ const DagEditor = forwardRef<DagEditorHandle, DagEditorProps>(function DagEditor
 
 export default DagEditor
 
+const INSTANCE_LEGEND_STATUSES: NodeInstanceStatus[] = [
+  'pending',
+  'running',
+  'succeeded',
+  'failed_skipped',
+  'failed',
+  'waiting_approval',
+]
+
 export function DagStatusLegend() {
   return (
-    <Space wrap>
-      <Space>
-        <FlagOutlined /> 未运行：灰色
-      </Space>
-      <Space>
-        <PlayCircleOutlined style={{ color: nodeBorderColor('running') }} /> 运行中：蓝框
-      </Space>
-      <Space>
-        <BranchesOutlined style={{ color: nodeBorderColor('succeeded') }} /> 成功：绿框
-      </Space>
-      <Space>
-        <span style={{ color: nodeBorderColor('failed_skipped') }}>●</span> 已跳过：灰虚线框
-      </Space>
-      <Space>
-        <span style={{ color: nodeBorderColor('failed') }}>●</span> 失败：红框
-      </Space>
-      <Space>
-        <span style={{ color: nodeBorderColor('waiting_approval') }}>●</span> 待审批：橙框
-      </Space>
+    <Space wrap size={[12, 4]}>
+      {INSTANCE_LEGEND_STATUSES.map((status) => (
+        <Space key={status} size={4}>
+          <span style={{ color: nodeBorderColor(status), fontSize: 12, lineHeight: 1 }}>●</span>
+          <span style={{ fontSize: 12 }}>{nodeStatusLabel(status)}</span>
+        </Space>
+      ))}
     </Space>
   )
 }

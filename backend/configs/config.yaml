@@ -12,3 +12,18 @@ database:
 cron:
   enabled: false
   schedule: "0 * * * * *"
+
+runtime:
+  # FLOW_ENV_OUT 根目录；留空或不可写时使用 /tmp/flow/env/{template_id}/{instance_id}
+  env_out_dir: ""
+
+lock:
+  provider: db
+  cron_leader_type: cron_scheduler_leader
+  ttl: 60s
+  renew_interval: 20s
+  redis:
+    addr: ""
+    password: ""
+    db: 0
+    key_prefix: "flow:lock:"

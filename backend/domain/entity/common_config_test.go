@@ -7,14 +7,14 @@ import (
 )
 
 func TestNewK8sConfig(t *testing.T) {
-	c, err := NewK8sConfig("prod", "https://k8s.example.com")
+	c, err := NewK8sConfig("prod", "https://k8s.example.com", "", "token", "default")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if c.Server != "https://k8s.example.com" {
 		t.Errorf("expected server, got %v", c.Server)
 	}
-	if _, err := NewK8sConfig("prod", ""); err == nil {
+	if _, err := NewK8sConfig("prod", "", "", "", ""); err == nil {
 		t.Error("expected error for empty server")
 	}
 }

@@ -21,21 +21,26 @@ type K8sConfig struct {
 	UpdatedAt  time.Time
 }
 
-// NewK8sConfig 创建 k8s 配置。
-// ID 由数据库自增生成。
-func NewK8sConfig(name, server string) (*K8sConfig, error) {
+// NewK8sConfig 创建 k8s 认证配置（kubeconfig 或 token+server 至少一种）。
+func NewK8sConfig(name, server, kubeconfig, token, namespace string) (*K8sConfig, error) {
 	if name == "" {
 		return nil, errors.New("k8s config name must not be empty")
 	}
-	if server == "" {
-		return nil, errors.New("k8s server must not be empty")
+	if kubeconfig == "" && (server == "" || token == "") {
+		return nil, errors.New("k8s config requires kubeconfig or server+token")
+	}
+	if namespace == "" {
+		namespace = "default"
 	}
 	now := time.Now()
 	return &K8sConfig{
-		Name:      name,
-		Server:    server,
-		CreatedAt: now,
-		UpdatedAt: now,
+		Name:       name,
+		Server:     server,
+		Kubeconfig: kubeconfig,
+		Token:      token,
+		Namespace:  namespace,
+		CreatedAt:  now,
+		UpdatedAt:  now,
 	}, nil
 }
 

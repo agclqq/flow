@@ -22,5 +22,8 @@ func NewDB(cfg config.DatabaseConfig) (*gorm.DB, error) {
 	if err := AutoMigrate(db); err != nil {
 		return nil, err
 	}
+	if err := SeedDistributedLocks(db); err != nil {
+		return nil, err
+	}
 	return db, nil
 }

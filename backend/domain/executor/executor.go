@@ -17,6 +17,17 @@ type ExecuteSpec struct {
 	Image string
 	// WorkingDir 为工作目录。
 	WorkingDir string
+	// Volumes / VolumeMounts 为 k8s Pod 卷与挂载（可选）。
+	Volumes      []PodVolume
+	VolumeMounts []PodVolumeMount
+	// Resources 为容器 resources.requests / limits（可选）。
+	Resources ContainerResources
+}
+
+// ContainerResources 对应 K8s 容器 resourceRequirements。
+type ContainerResources struct {
+	Requests map[string]string
+	Limits   map[string]string
 }
 
 // ExecuteResult 描述一次执行的返回结果。

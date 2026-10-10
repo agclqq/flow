@@ -25,19 +25,20 @@ const DagEditor = lazy(() => import('../components/dag/DagEditor'))
 const EDIT_TAB_KEYS = ['config', 'dag', 'system-params'] as const
 type EditTabKey = (typeof EDIT_TAB_KEYS)[number]
 
-function parseEditTab(tab: string | null): EditTabKey {
+function parseEditTab(tab: string | null, defaultTab: EditTabKey): EditTabKey {
   if (tab && EDIT_TAB_KEYS.includes(tab as EditTabKey)) {
     return tab as EditTabKey
   }
-  return 'config'
+  return defaultTab
 }
 
 export default function TemplateEditPage() {
   const { id } = useParams()
   const navigate = useNavigate()
   const [searchParams, setSearchParams] = useSearchParams()
-  const activeTab = parseEditTab(searchParams.get('tab'))
   const isNew = !id
+  const defaultEditTab: EditTabKey = isNew ? 'config' : 'dag'
+  const activeTab = parseEditTab(searchParams.get('tab'), defaultEditTab)
   const routeTemplateId = id ? Number(id) : null
   const [form] = Form.useForm<ConfigFormValues>()
   const dagRef = useRef<DagEditorHandle>(null)
@@ -48,10 +49,11 @@ export default function TemplateEditPage() {
   const [prefetchedDagNodes, setPrefetchedDagNodes] = useState<FlowNode[] | null>(null)
   const [prefetchedDagKey, setPrefetchedDagKey] = useState('')
   const [loading, setLoading] = useState(!isNew)
-  const [saving, setSaving] = useState(false)
+  const [configSaving, setConfigSaving] = useState(false)
   const [publishing, setPublishing] = useState(false)
   const [notifyTemplates, setNotifyTemplates] = useState<{ id: number; name: string; content: string }[]>([])
   const [existingParams, setExistingParams] = useState<FlowParam[]>([])
+  const [dagNeedsName, setDagNeedsName] = useState(false)
 
   const watchedParams = Form.useWatch('params', form) as FlowParam[] | undefined
   const paramNames = useMemo(
@@ -138,12 +140,38 @@ export default function TemplateEditPage() {
     }
     const created = await createTemplate(values.name)
     const editing = await getEditingVersion(created.id)
+    const nodes = await listNodes(created.id, editing.version_id)
     setCreatedTemplateId(created.id)
     setVersionId(editing.version_id)
     setIsDraftVersion(true)
-    navigate(`/templates/${created.id}/edit`, { replace: true })
+    syncPrefetchedDag(created.id, editing.version_id, nodes)
+    setDagNeedsName(false)
+    const tabQuery = activeTab !== defaultEditTab ? `?tab=${activeTab}` : ''
+    navigate(`/templates/${created.id}/edit${tabQuery}`, { replace: true })
     return { templateId: created.id, versionId: editing.version_id }
   }
+
+  // 新建页进入 DAG：与编辑页一致，有名称则自动创建模板并加载草稿（含默认开始节点）。
+  useEffect(() => {
+    if (activeTab !== 'dag' || templateId) {
+      setDagNeedsName(false)
+      return
+    }
+    const name = String(form.getFieldValue('name') ?? '').trim()
+    if (!name) {
+      setDagNeedsName(true)
+      return
+    }
+    setDagNeedsName(false)
+    void (async () => {
+      try {
+        await ensureTemplate()
+      } catch {
+        setDagNeedsName(true)
+      }
+    })()
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- 仅在进入 DAG 且尚未有模板时引导创建
+  }, [activeTab, templateId])
 
   const resolveWritableVersion = async (
     tid: number,
@@ -177,11 +205,11 @@ export default function TemplateEditPage() {
     )
   }, [templateId, versionId])
 
-  const handleSave = async () => {
-    setSaving(true)
+  const handleSaveConfig = async () => {
+    setConfigSaving(true)
     try {
-      const values = await form.validateFields()
-      const issues = await collectConnectivityIssues()
+      await form.validateFields()
+      const values = form.getFieldsValue(true) as ConfigFormValues
       const ids = await ensureTemplate()
       const writableVersionId = await resolveWritableVersion(
         ids.templateId,
@@ -195,7 +223,6 @@ export default function TemplateEditPage() {
           timings: values.notify_timings,
         })
       }
-      await dagRef.current?.saveNodeConfigs(writableVersionId)
       if (writableVersionId !== ids.versionId) {
         setVersionId(writableVersionId)
         setIsDraftVersion(true)
@@ -203,22 +230,20 @@ export default function TemplateEditPage() {
       const params = await listParams(ids.templateId, writableVersionId)
       setExistingParams(params)
       form.setFieldValue('params', params)
-      message.success('已保存')
-      // 连通性不完整只提示，不阻拦保存。
-      if (issues.length > 0) {
-        message.warning(`流水线尚不完整：${issues.join('；')}`)
-      }
+      message.success('配置已保存')
     } catch (error) {
-      message.error(error instanceof Error ? error.message : '保存失败')
+      message.error(error instanceof Error ? error.message : '保存配置失败')
     } finally {
-      setSaving(false)
+      setConfigSaving(false)
     }
   }
 
   const handlePublish = async () => {
     setPublishing(true)
     try {
-      const values = await form.validateFields()
+      await form.validateFields()
+      // 未打开「配置信息」Tab 时 Switch 未挂载，需从 Form 全量 store 读取（preserve 字段）。
+      const values = form.getFieldsValue(true) as ConfigFormValues
       // 连通性不完整则禁止发布，弹窗二次提醒。
       const issues = await collectConnectivityIssues()
       if (issues.length > 0) {
@@ -270,17 +295,12 @@ export default function TemplateEditPage() {
             {isNew ? '新建流水线模板' : `编辑流水线模板 #${templateId}`}
           </Typography.Title>
           {!isNew && !isDraftVersion && !loading && (
-            <Typography.Text type="secondary">（基于已发布版本编辑，保存时将创建新版本）</Typography.Text>
+            <Typography.Text type="secondary">（基于已发布版本编辑，发布前将写入新草稿）</Typography.Text>
           )}
         </Space>
-        <Space>
-          <Button loading={saving} onClick={() => void handleSave()}>
-            保存
-          </Button>
-          <Button type="primary" loading={publishing} disabled={isNew && !templateId} onClick={() => void handlePublish()}>
-            发布
-          </Button>
-        </Space>
+        <Button type="primary" loading={publishing} disabled={isNew && !templateId} onClick={() => void handlePublish()}>
+          发布
+        </Button>
       </Space>
       <Tabs
         activeKey={activeTab}
@@ -288,7 +308,7 @@ export default function TemplateEditPage() {
           setSearchParams(
             (prev) => {
               const next = new URLSearchParams(prev)
-              if (key === 'config') {
+              if (key === defaultEditTab) {
                 next.delete('tab')
               } else {
                 next.set('tab', key)
@@ -302,32 +322,44 @@ export default function TemplateEditPage() {
           {
             key: 'config',
             label: '配置信息',
+            forceRender: true,
             children: (
-              <ConfigTab
-                form={form}
-                notifyTemplates={notifyTemplates}
-                loading={loading}
-                isNew={isNew}
-                templateId={templateId}
-              />
+              <div style={{ height: 'calc(100vh - 200px)', minHeight: 360 }}>
+                <ConfigTab
+                  form={form}
+                  notifyTemplates={notifyTemplates}
+                  loading={loading}
+                  isNew={isNew}
+                  templateId={templateId}
+                  saving={configSaving}
+                  onSave={handleSaveConfig}
+                />
+              </div>
             ),
           },
           {
             key: 'dag',
             label: 'DAG 编排',
             children: (
-              <Suspense fallback={<Spin description="加载 DAG 编辑器..." />}>
-                <DagEditor
-                  ref={dagRef}
-                  editable
-                  writable={isDraftVersion}
-                  templateId={templateId ?? undefined}
-                  versionId={versionId ?? undefined}
-                  paramNames={paramNames}
-                  prefetchedNodes={prefetchedDagNodes}
-                  prefetchedKey={prefetchedDagKey}
-                />
-              </Suspense>
+              <>
+                {dagNeedsName && (
+                  <Typography.Paragraph type="warning" style={{ marginBottom: 8 }}>
+                    请先在「配置信息」中填写模板名称；填写后回到本页或切换 Tab 即可开始编排（与编辑已有模板相同）。
+                  </Typography.Paragraph>
+                )}
+                <Suspense fallback={<Spin description="加载 DAG 编辑器..." />}>
+                  <DagEditor
+                    ref={dagRef}
+                    editable
+                    writable={isDraftVersion && !!templateId && !!versionId}
+                    templateId={templateId ?? undefined}
+                    versionId={versionId ?? undefined}
+                    paramNames={paramNames}
+                    prefetchedNodes={prefetchedDagNodes}
+                    prefetchedKey={prefetchedDagKey}
+                  />
+                </Suspense>
+              </>
             ),
           },
           {

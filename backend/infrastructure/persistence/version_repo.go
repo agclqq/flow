@@ -93,6 +93,39 @@ func (r *FlowTemplateVersionRepository) GetLatestPublishedByTemplate(ctx context
 	return ver, nil
 }
 
+// ListPublishedCronTriggers 返回各模板最新已发布版本中开启 cron 的规则。
+func (r *FlowTemplateVersionRepository) ListPublishedCronTriggers(ctx context.Context) ([]entity.PublishedCronRule, error) {
+	var models []FlowTemplateVersionModel
+	published := valueobject.TemplateStatusPublishedInt
+	err := r.db.WithContext(ctx).Raw(`
+		SELECT v.*
+		FROM flow_template_versions v
+		INNER JOIN (
+			SELECT template_id, MAX(version) AS max_version
+			FROM flow_template_versions
+			WHERE status = ?
+			GROUP BY template_id
+		) latest ON v.template_id = latest.template_id AND v.version = latest.max_version
+		WHERE v.status = ?
+	`, published, published).Scan(&models).Error
+	if err != nil {
+		return nil, err
+	}
+	out := make([]entity.PublishedCronRule, 0)
+	for i := range models {
+		trigger := unmarshalTriggerConfig(models[i].TriggerConfig)
+		if !trigger.Cron || trigger.CronExpr == "" {
+			continue
+		}
+		out = append(out, entity.PublishedCronRule{
+			TemplateID: models[i].TemplateID,
+			VersionID:  models[i].ID,
+			CronExpr:   trigger.CronExpr,
+		})
+	}
+	return out, nil
+}
+
 // ListByTemplate 查询某个模板下的所有版本（不加载节点）。
 func (r *FlowTemplateVersionRepository) ListByTemplate(ctx context.Context, templateID int64) ([]*entity.FlowTemplateVersion, error) {
 	var models []FlowTemplateVersionModel

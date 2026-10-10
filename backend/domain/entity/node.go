@@ -47,8 +47,19 @@ type Node struct {
 
 	// RuntimeKind 执行资源类型：local / ssh / k8s，空值视为 local。
 	RuntimeKind string
-	// ResourceID 引用的执行资源 ID（ssh/k8s 必填，local 忽略）。
+	// ResourceID 引用的执行资源 ID（ssh 必填；k8s 旧数据兼容）。
 	ResourceID int64
+	// K8sAuthID 引用的 k8s_configs 认证 ID（runtime_kind=k8s 时使用）。
+	K8sAuthID int64
+	// K8sNamespace 运行命名空间，空则使用认证配置默认值。
+	K8sNamespace string
+	// K8sImage 执行镜像（含 tag），如 alpine:3.19。
+	K8sImage string
+	// K8sVolumes / K8sVolumeMounts Pod 卷与挂载。
+	K8sVolumes      []K8sVolume
+	K8sVolumeMounts []K8sVolumeMount
+	// K8sResources 容器 CPU/内存/GPU 等 requests 与 limits。
+	K8sResources K8sResourceRequirements
 
 	// PositionX/PositionY DAG 画布坐标，仅可视化节点使用。
 	PositionX *float64

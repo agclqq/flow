@@ -84,8 +84,19 @@ type NodeModel struct {
 	PositionY *float64       `gorm:"type:double precision"`
 	// RuntimeKind 执行资源类型：local/ssh/k8s，空视为 local。
 	RuntimeKind string `gorm:"type:varchar(32);not null;default:'local'"`
-	// ResourceID 引用的执行资源 ID（ssh/k8s 使用）。
-	ResourceID int64          `gorm:"type:bigint;not null;default:0"`
+	// ResourceID 引用的执行资源 ID（ssh 使用；k8s 旧数据兼容）。
+	ResourceID int64 `gorm:"type:bigint;not null;default:0"`
+	// K8sAuthID 引用的 k8s_configs.id。
+	K8sAuthID int64 `gorm:"type:bigint;not null;default:0;index"`
+	// K8sNamespace 运行命名空间覆盖。
+	K8sNamespace string `gorm:"type:varchar(128)"`
+	// K8sImage 执行镜像（含 tag）。
+	K8sImage string `gorm:"type:varchar(512)"`
+	// K8sVolumes / K8sVolumeMounts JSON。
+	K8sVolumes      string `gorm:"type:jsonb;not null;default:'[]'"`
+	K8sVolumeMounts string `gorm:"type:jsonb;not null;default:'[]'"`
+	// K8sResources requests/limits JSON。
+	K8sResources string `gorm:"type:jsonb;not null;default:'{}'"`
 	CreatedAt  time.Time      `gorm:"not null"`
 	UpdatedAt  time.Time      `gorm:"not null"`
 	DeletedAt  gorm.DeletedAt `gorm:"index"`

@@ -22,5 +22,6 @@ func AutoMigrate(db *gorm.DB) error {
 		&K8sConfigModel{},
 		&BareMetalConfigModel{},
 		&RepoConfigModel{},
+		&DistributedLockModel{},
 	)
 }

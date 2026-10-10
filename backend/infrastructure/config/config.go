@@ -11,6 +11,14 @@ type Config struct {
 	Server   ServerConfig   `mapstructure:"server"`
 	Database DatabaseConfig `mapstructure:"database"`
 	Cron     CronConfig     `mapstructure:"cron"`
+	Lock     LockConfig     `mapstructure:"lock"`
+	Runtime  RuntimeConfig  `mapstructure:"runtime"`
+}
+
+// RuntimeConfig 脚本运行时相关配置。
+type RuntimeConfig struct {
+	// EnvOutDir FLOW_ENV_OUT 文件根目录，实例目录为 {EnvOutDir}/{template_id}/{instance_id}。
+	EnvOutDir string `mapstructure:"env_out_dir"`
 }
 
 // ServerConfig HTTP 服务配置。
@@ -32,6 +40,23 @@ type DatabaseConfig struct {
 type CronConfig struct {
 	Enabled  bool   `mapstructure:"enabled"`
 	Schedule string `mapstructure:"schedule"`
+}
+
+// LockConfig 分布式锁配置。
+type LockConfig struct {
+	Provider      string        `mapstructure:"provider"` // db | redis
+	CronLeaderType string       `mapstructure:"cron_leader_type"`
+	TTL           string        `mapstructure:"ttl"`
+	RenewInterval string        `mapstructure:"renew_interval"`
+	Redis         RedisConfig   `mapstructure:"redis"`
+}
+
+// RedisConfig Redis 连接（用于分布式锁）。
+type RedisConfig struct {
+	Addr       string `mapstructure:"addr"`
+	Password   string `mapstructure:"password"`
+	DB         int    `mapstructure:"db"`
+	KeyPrefix  string `mapstructure:"key_prefix"`
 }
 
 // Load 从指定配置文件加载配置，并允许环境变量覆盖。
@@ -66,5 +91,14 @@ func Default() *Config {
 			SSLMode: "disable",
 		},
 		Cron: CronConfig{Enabled: false},
+		Lock: LockConfig{
+			Provider:       "db",
+			CronLeaderType: "cron_scheduler_leader",
+			TTL:            "60s",
+			RenewInterval:  "20s",
+			Redis: RedisConfig{
+				KeyPrefix: "flow:lock:",
+			},
+		},
 	}
 }

@@ -4,7 +4,7 @@ import { useNavigate, useParams } from 'react-router-dom'
 import { approveNodeInstance, getInstance, listNodeOperationLogs, rejectNodeInstance, retryInstance, skipNodeInstance } from '../api/instances'
 import { getTemplate, getVersion } from '../api/templates'
 import type { FlowInstance, FlowNode, FlowTemplate, NodeInstance, NodeOperationLog } from '../api/types'
-import { SYSTEM_PARAM_KEYS } from '../constants/systemParams'
+import { INSTANCE_SYSTEM_PARAM_KEYS } from '../constants/systemParams'
 
 const ScriptEditor = lazy(() => import('../components/dag/ScriptEditor'))
 import DagEditor, { DagStatusLegend } from '../components/dag/DagEditor'
@@ -118,17 +118,19 @@ export default function InstanceDetailPage() {
 
   // 系统参数取值：优先实例 env（后端创建实例时注入）；旧实例或节点级参数回退展示。
   const systemParamValue = (key: string): string => {
-    const fromEnv = instance?.env?.[key]
+    const legacyKey = key.toLowerCase()
+    const fromEnv = instance?.env?.[key] ?? instance?.env?.[legacyKey]
     if (fromEnv !== undefined && fromEnv !== '') return fromEnv
     switch (key) {
-      case 'template_id':
+      case 'TEMPLATE_ID':
         return String(tplId)
-      case 'template_name':
+      case 'TEMPLATE_NAME':
         return template?.name ?? '-'
-      case 'template_owner':
+      case 'TEMPLATE_OWNER':
         return template?.owners?.join('、') || '-'
+      case 'INSTANCE_ID':
+        return instance?.id != null ? String(instance.id) : '-'
       default:
-        // node_owner 为节点级参数，实例维度无固定值
         return '-'
     }
   }
@@ -164,36 +166,6 @@ export default function InstanceDetailPage() {
   const handleOperatorChange = (value: string) => {
     setOperator(value)
     localStorage.setItem('flow_operator', value)
-  }
-
-  const handleApprove = async () => {
-    if (!selectedNode) return
-    setActing(true)
-    try {
-      await approveNodeInstance(tplId, instId, selectedNode.node_id, operator)
-      message.success('已通过审批')
-      await loadData()
-      await refreshOperationLogs()
-    } catch (error) {
-      message.error(error instanceof Error ? error.message : '审批失败')
-    } finally {
-      setActing(false)
-    }
-  }
-
-  const handleReject = async () => {
-    if (!selectedNode) return
-    setActing(true)
-    try {
-      await rejectNodeInstance(tplId, instId, selectedNode.node_id, operator)
-      message.success('已拒绝')
-      await loadData()
-      await refreshOperationLogs()
-    } catch (error) {
-      message.error(error instanceof Error ? error.message : '拒绝失败')
-    } finally {
-      setActing(false)
-    }
   }
 
   // 重试失败实例：状态回到运行中，失败的节点重新执行，页面恢复秒级轮询。
@@ -260,14 +232,21 @@ export default function InstanceDetailPage() {
   }
 
   return (
-    <Space orientation="vertical" size={16} style={{ width: '100%' }}>
-      <Space style={{ width: '100%', justifyContent: 'space-between' }}>
+    <div
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        width: '100%',
+        height: 'calc(100vh - 64px - 48px)',
+        minHeight: 420,
+      }}
+    >
+      <Space style={{ width: '100%', justifyContent: 'space-between', marginBottom: 16, flexShrink: 0 }}>
         <Typography.Title level={3} style={{ margin: 0 }}>
           {template ? `${template.name} - 实例 #${instId}` : `实例 #${instId}`}
         </Typography.Title>
         <Space>
           <Button onClick={() => navigate(`/templates/${tplId}/instances`)}>返回列表</Button>
-          <Button onClick={() => void loadData()}>刷新</Button>
           {instance?.status === 'failed' && (
             <Button type="primary" danger loading={acting} onClick={() => void handleRetry()}>
               重试
@@ -276,8 +255,17 @@ export default function InstanceDetailPage() {
         </Space>
       </Space>
 
-      <div style={{ display: 'grid', gridTemplateColumns: '300px 1fr', gap: 16 }}>
+      <div
+        style={{
+          flex: 1,
+          minHeight: 0,
+          display: 'grid',
+          gridTemplateColumns: '300px 1fr',
+          gap: 16,
+        }}
+      >
         <Collapse
+          style={{ overflow: 'auto', alignSelf: 'stretch' }}
           defaultActiveKey={['info']}
           items={[
             {
@@ -307,8 +295,8 @@ export default function InstanceDetailPage() {
               label: '系统参数',
               children: (
                 <Descriptions column={1} size="small">
-                  {SYSTEM_PARAM_KEYS.map((key) => (
-                    <Descriptions.Item key={key} label={<code>{key}</code>}>
+                  {INSTANCE_SYSTEM_PARAM_KEYS.map((key) => (
+                    <Descriptions.Item key={key} label={key}>
                       {systemParamValue(key)}
                     </Descriptions.Item>
                   ))}
@@ -318,17 +306,25 @@ export default function InstanceDetailPage() {
           ]}
         />
 
-        <Card title="执行视图" size="small" extra={<DagStatusLegend />}>
-          <DagEditor
-            readOnly
-            templateId={tplId}
-            versionId={instance?.template_version_id}
-            paramNames={paramNames}
-            nodeInstances={instance?.node_instances}
-            onNodeInstanceClick={setSelectedNode}
-            onApproveNode={handleCanvasApprove}
-            onRejectNode={handleCanvasReject}
-          />
+        <Card
+          title="执行视图"
+          size="small"
+          extra={<DagStatusLegend />}
+          style={{ height: '100%', minHeight: 0, display: 'flex', flexDirection: 'column' }}
+          styles={{ body: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', padding: 12 } }}
+        >
+          <div style={{ flex: 1, minHeight: 0 }}>
+            <DagEditor
+              readOnly
+              templateId={tplId}
+              versionId={instance?.template_version_id}
+              paramNames={paramNames}
+              nodeInstances={instance?.node_instances}
+              onNodeInstanceClick={setSelectedNode}
+              onApproveNode={handleCanvasApprove}
+              onRejectNode={handleCanvasReject}
+            />
+          </div>
         </Card>
       </div>
 
@@ -338,16 +334,7 @@ export default function InstanceDetailPage() {
         onClose={() => setSelectedNode(null)}
         size={520}
         extra={
-          selectedNode?.status === 'waiting_approval' ? (
-            <Space>
-              <Button danger loading={acting} onClick={() => void handleReject()}>
-                拒绝
-              </Button>
-              <Button type="primary" loading={acting} onClick={() => void handleApprove()}>
-                通过
-              </Button>
-            </Space>
-          ) : selectedNode?.status === 'running' ? (
+          selectedNode?.status === 'running' ? (
             <Button type="primary" danger onClick={handleSkip}>
               跳过
             </Button>
@@ -472,6 +459,6 @@ export default function InstanceDetailPage() {
           </>
         )}
       </Drawer>
-    </Space>
+    </div>
   )
 }

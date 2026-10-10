@@ -5,8 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 
@@ -14,6 +12,7 @@ import (
 	"flow/domain/executor"
 	"flow/domain/repository"
 	"flow/domain/valueobject"
+	"flow/infrastructure/runtime"
 )
 
 // ErrWorkflowPaused 表示流水线因等待人工审批而暂停。
@@ -37,9 +36,12 @@ type Scheduler struct {
 	instRepo    repository.FlowInstanceRepository
 	versionRepo repository.FlowTemplateVersionRepository
 	logger      *slog.Logger
+	envOutDir   string // FLOW_ENV_OUT 配置根目录
 	// runCancels 正在执行的节点实例 → 取消函数，用于手动跳过时终止脚本。
 	runCancels   map[int64]context.CancelFunc
 	runCancelsMu sync.Mutex
+	// instEnvMu 保护实例级 env 的并发按 key 合并与落库。
+	instEnvMu sync.Mutex
 }
 
 // NewScheduler 构造调度器。
@@ -49,6 +51,7 @@ func NewScheduler(
 	instRepo repository.FlowInstanceRepository,
 	versionRepo repository.FlowTemplateVersionRepository,
 	logger *slog.Logger,
+	envOutDir string,
 ) *Scheduler {
 	return &Scheduler{
 		executor:    exec,
@@ -56,6 +59,7 @@ func NewScheduler(
 		instRepo:    instRepo,
 		versionRepo: versionRepo,
 		logger:      logger,
+		envOutDir:   envOutDir,
 		runCancels:  map[int64]context.CancelFunc{},
 	}
 }
@@ -67,7 +71,47 @@ func (s *Scheduler) resolveExecutor(ctx context.Context, n *entity.Node) (execut
 			return s.executor, nil
 		}
 	}
-	return s.resources.resolveRuntime(ctx, n.RuntimeKind, n.ResourceID)
+	return s.resources.ResolveNodeExecutor(ctx, n)
+}
+
+func (s *Scheduler) buildExecuteSpec(n *entity.Node, instanceID int64, command string, env map[string]string) executor.ExecuteSpec {
+	spec := executor.ExecuteSpec{
+		InstanceID: instanceID,
+		Command:    executor.ExpandScriptPlaceholders(command, env),
+		Env:        env,
+	}
+	if n.RuntimeKind != executor.RuntimeKindK8s {
+		return spec
+	}
+	spec.Image = n.K8sImage
+	for _, vol := range n.K8sVolumes {
+		spec.Volumes = append(spec.Volumes, executor.PodVolume{
+			Name: vol.Name, Type: vol.Type, Source: vol.Source,
+		})
+	}
+	for _, mount := range n.K8sVolumeMounts {
+		spec.VolumeMounts = append(spec.VolumeMounts, executor.PodVolumeMount{
+			Name: mount.Name, MountPath: mount.MountPath, SubPath: mount.SubPath, ReadOnly: mount.ReadOnly,
+		})
+	}
+	if !n.K8sResources.IsEmpty() {
+		spec.Resources = executor.ContainerResources{
+			Requests: copyResourceMap(n.K8sResources.Requests),
+			Limits:   copyResourceMap(n.K8sResources.Limits),
+		}
+	}
+	return spec
+}
+
+func copyResourceMap(m map[string]string) map[string]string {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
 }
 
 // Run 执行流水线实例（首次运行，创建节点实例）。
@@ -76,6 +120,8 @@ func (s *Scheduler) Run(ctx context.Context, inst *entity.FlowInstance) error {
 	if err != nil {
 		return fmt.Errorf("load version: %w", err)
 	}
+
+	s.prepareInstanceEnvOutFiles(inst, ver.Nodes)
 
 	nodeInstMap := make(map[int64]*entity.NodeInstance)
 	for _, n := range ver.Nodes {
@@ -112,6 +158,9 @@ func (s *Scheduler) Continue(ctx context.Context, inst *entity.FlowInstance) err
 	for _, ni := range nis {
 		nodeInstMap[ni.NodeID] = ni
 	}
+
+	s.prepareInstanceEnvOutFiles(inst, ver.Nodes)
+	s.syncNodeInstancesEnv(ctx, inst, ver.Nodes, nodeInstMap)
 
 	state := s.rebuildState(ver.Nodes, nodeInstMap)
 	return s.execute(ctx, inst, ver.Nodes, nodeInstMap, state)
@@ -309,7 +358,7 @@ func (s *Scheduler) execute(ctx context.Context, inst *entity.FlowInstance, node
 		switch {
 		case len(readyTasks) > 0:
 			// 同一轮就绪的任务节点并发执行（含 start_script 与跳过判定）。
-			s.executeTaskNodesConcurrently(ctx, readyTasks, inst, nodeInstMap, state)
+			s.executeTaskNodesConcurrently(ctx, readyTasks, inst, nodes, nodeInstMap, state)
 			progress = true
 
 		case readyManual != nil:
@@ -318,7 +367,7 @@ func (s *Scheduler) execute(ctx context.Context, inst *entity.FlowInstance, node
 				s.transitionNodeInst(ctx, nodeInstMap[readyManual.ID], valueobject.NodeInstanceStatusRunning)
 				s.completeNodeInst(ctx, nodeInstMap[readyManual.ID], valueobject.NodeInstanceStatusFailedSkipped, nil)
 			} else {
-				s.pauseManualNode(ctx, nodeInstMap[readyManual.ID], state, readyManual.ID)
+				s.pauseManualNode(ctx, inst, readyManual, nodeInstMap[readyManual.ID], state, readyManual.ID)
 				if err := s.instRepo.Update(ctx, inst); err != nil {
 					s.logger.Error("update instance env failed", "instance_id", inst.ID, "error", err)
 				}
@@ -496,7 +545,11 @@ func (s *Scheduler) evaluateStartScript(ctx context.Context, n *entity.Node, ins
 	return result.ExitCode == 0
 }
 
-func (s *Scheduler) pauseManualNode(ctx context.Context, ni *entity.NodeInstance, state map[int64]int, nodeID int64) {
+func (s *Scheduler) pauseManualNode(ctx context.Context, inst *entity.FlowInstance, n *entity.Node, ni *entity.NodeInstance, state map[int64]int, nodeID int64) {
+	s.refreshNodeEnv(inst, ni, n)
+	if err := s.instRepo.UpdateNodeInstance(ctx, ni); err != nil {
+		s.logger.Warn("persist manual node env failed", "node_id", nodeID, "error", err)
+	}
 	s.transitionNodeInst(ctx, ni, valueobject.NodeInstanceStatusRunning)
 	s.transitionNodeInst(ctx, ni, valueobject.NodeInstanceStatusWaitingApproval)
 	state[nodeID] = nodeWaitingApproval
@@ -538,23 +591,100 @@ func (s *Scheduler) refreshNodeEnv(inst *entity.FlowInstance, ni *entity.NodeIns
 	for k, v := range inst.Env {
 		ni.Env[k] = v
 	}
-	// 节点级系统参数：负责人列表以逗号连接。
-	if node != nil && len(node.Owners) > 0 {
-		ni.Env["node_owner"] = strings.Join(node.Owners, ",")
+	ni.Env["INSTANCE_ID"] = fmt.Sprintf("%d", inst.ID)
+	if node != nil {
+		ni.Env["NODE_ID"] = fmt.Sprintf("%d", node.ID)
+		ni.Env["NODE_NAME"] = node.Name
+		if len(node.Owners) > 0 {
+			ni.Env["NODE_OWNER"] = strings.Join(node.Owners, ",")
+		}
 	}
-	ni.Env[executor.EnvOutFileKey] = s.envOutPath(inst.ID, ni.NodeID)
+	ni.Env[executor.EnvOutFileKey] = s.envOutPath(inst, ni.NodeID)
 }
 
-func (s *Scheduler) envOutPath(instanceID, nodeID int64) string {
-	return filepath.Join(os.TempDir(), "flow", fmt.Sprintf("%d", instanceID), fmt.Sprintf("%d.env.out", nodeID))
+func (s *Scheduler) envOutPath(inst *entity.FlowInstance, nodeID int64) string {
+	dir := runtime.ResolveEnvOutInstanceDir(s.envOutDir, inst.TemplateID, inst.ID)
+	return runtime.EnvOutFilePath(dir, nodeID)
 }
 
+func (s *Scheduler) prepareInstanceEnvOutFiles(inst *entity.FlowInstance, nodes []*entity.Node) {
+	dir := runtime.ResolveEnvOutInstanceDir(s.envOutDir, inst.TemplateID, inst.ID)
+	for _, n := range nodes {
+		if n.IsEdge() {
+			continue
+		}
+		path := runtime.EnvOutFilePath(dir, n.ID)
+		if err := runtime.EnsureEnvOutFile(path); err != nil {
+			s.logger.Warn("prepare FLOW_ENV_OUT file failed", "path", path, "error", err)
+		}
+	}
+}
+
+func (s *Scheduler) nodeByIDFromNodes(nodes []*entity.Node) map[int64]*entity.Node {
+	nodeByID := make(map[int64]*entity.Node, len(nodes))
+	for _, n := range nodes {
+		if !n.IsEdge() {
+			nodeByID[n.ID] = n
+		}
+	}
+	return nodeByID
+}
+
+func (s *Scheduler) syncNodeInstancesEnv(
+	ctx context.Context,
+	inst *entity.FlowInstance,
+	nodes []*entity.Node,
+	nodeInstMap map[int64]*entity.NodeInstance,
+) {
+	nodeByID := s.nodeByIDFromNodes(nodes)
+	for nodeID, ni := range nodeInstMap {
+		s.refreshNodeEnv(inst, ni, nodeByID[nodeID])
+		if err := s.instRepo.UpdateNodeInstance(ctx, ni); err != nil {
+			s.logger.Warn("sync node instance env failed", "node_id", nodeID, "error", err)
+		}
+	}
+}
+
+// syncUnstartedNodeInstancesEnv 在上游导出合并后，刷新尚未开始执行的节点实例 env（便于 UI 与后续脚本一致）。
+func (s *Scheduler) syncUnstartedNodeInstancesEnv(
+	ctx context.Context,
+	inst *entity.FlowInstance,
+	nodes []*entity.Node,
+	nodeInstMap map[int64]*entity.NodeInstance,
+) {
+	nodeByID := s.nodeByIDFromNodes(nodes)
+	for nodeID, ni := range nodeInstMap {
+		switch ni.Status {
+		case valueobject.NodeInstanceStatusPending,
+			valueobject.NodeInstanceStatusWaitingApproval,
+			valueobject.NodeInstanceStatusRetrying:
+		default:
+			continue
+		}
+		s.refreshNodeEnv(inst, ni, nodeByID[nodeID])
+		if err := s.instRepo.UpdateNodeInstance(ctx, ni); err != nil {
+			s.logger.Warn("sync unstarted node env failed", "node_id", nodeID, "error", err)
+		}
+	}
+}
+
+// mergeExportedEnv 将节点导出的变量按 key 合并进实例全局 env，并立即落库。
 func (s *Scheduler) mergeExportedEnv(ctx context.Context, inst *entity.FlowInstance, ni *entity.NodeInstance, exported map[string]string) {
 	if len(exported) == 0 {
 		return
 	}
-	inst.UpdateEnv(exported)
+	s.instEnvMu.Lock()
+	defer s.instEnvMu.Unlock()
+	if inst.Env == nil {
+		inst.Env = make(map[string]string)
+	}
 	for k, v := range exported {
+		inst.Env[k] = v
+	}
+	for k, v := range exported {
+		if ni.Env == nil {
+			ni.Env = make(map[string]string)
+		}
 		ni.Env[k] = v
 	}
 	ni.SetOutputEnv(exported)
@@ -566,8 +696,11 @@ func (s *Scheduler) mergeExportedEnv(ctx context.Context, inst *entity.FlowInsta
 
 func (s *Scheduler) runScript(ctx context.Context, n *entity.Node, inst *entity.FlowInstance, ni *entity.NodeInstance, command string) (executor.ExecuteResult, error) {
 	s.refreshNodeEnv(inst, ni, n)
+	if err := s.instRepo.UpdateNodeInstance(ctx, ni); err != nil {
+		s.logger.Warn("persist node env before script failed", "node_id", n.ID, "error", err)
+	}
 	result, err := s.executor.Execute(ctx, executor.ExecuteSpec{
-		Command: command,
+		Command: executor.ExpandScriptPlaceholders(command, ni.Env),
 		Env:     ni.Env,
 	})
 	if err != nil {
@@ -605,7 +738,7 @@ func (s *Scheduler) executeScripts(ctx context.Context, n *entity.Node, inst *en
 }
 
 // taskRunResult 是单个任务节点脚本的执行结果。
-// exportedEnv 汇总该节点各脚本导出的环境变量，由调度器在全部完成后串行合并。
+// exportedEnv 汇总该节点各脚本导出的环境变量；节点成功后立即按 key 合并进 inst.Env。
 type taskRunResult struct {
 	ok          bool
 	skipped     bool
@@ -613,12 +746,13 @@ type taskRunResult struct {
 }
 
 // executeTaskNodesConcurrently 并发执行同一轮就绪的任务节点。
-// 各节点基于启动时的同一份环境快照运行；导出的环境变量在全部完成后串行合并，
-// 避免并发修改 inst.Env 产生数据竞争。失败不影响其他并发节点的执行。
+// 各节点基于启动时的环境快照运行；单个节点成功后会立即将导出变量按 key 写入 inst.Env。
+// 同一批并发节点之间的覆盖顺序不做保证。失败不影响其他并发节点的执行。
 func (s *Scheduler) executeTaskNodesConcurrently(
 	ctx context.Context,
 	readyNodes []*entity.Node,
 	inst *entity.FlowInstance,
+	nodes []*entity.Node,
 	nodeInstMap map[int64]*entity.NodeInstance,
 	state map[int64]int,
 ) {
@@ -653,7 +787,7 @@ func (s *Scheduler) executeTaskNodesConcurrently(
 			s.registerCancel(ni.ID, cancel)
 			defer s.popCancel(ni.ID)
 
-			res := s.runTaskScripts(runCtx, exec, n, inst.ID, ni, baseEnv)
+			res := s.runTaskScripts(runCtx, exec, inst, n, ni, baseEnv)
 			results[i] = res
 			// 已被手动跳过（终态）：不覆盖状态，结果由串行阶段按跳过处理。
 			if ni.Status == valueobject.NodeInstanceStatusSkipped {
@@ -666,13 +800,14 @@ func (s *Scheduler) executeTaskNodesConcurrently(
 			case !res.ok:
 				s.completeNodeInst(ctx, ni, valueobject.NodeInstanceStatusFailed, ni.OutputEnv)
 			default:
+				s.mergeExportedEnv(ctx, inst, ni, res.exportedEnv)
 				s.completeNodeInst(ctx, ni, valueobject.NodeInstanceStatusSucceeded, ni.OutputEnv)
 			}
 		}(i, n, ni, exec)
 	}
 	wg.Wait()
 
-	// 实例级共享状态（环境变量、state 表、失败标记）在批次结束后串行应用。
+	// 实例级 state、失败标记在批次结束后串行应用（env 已在各节点成功时写入）。
 	anyFailed := false
 	for i, n := range readyNodes {
 		ni := nodeInstMap[n.ID]
@@ -682,7 +817,6 @@ func (s *Scheduler) executeTaskNodesConcurrently(
 			state[n.ID] = nodeDone
 			continue
 		}
-		s.mergeExportedEnv(ctx, inst, ni, res.exportedEnv)
 		switch {
 		case res.skipped:
 			state[n.ID] = nodeSkipped
@@ -696,16 +830,17 @@ func (s *Scheduler) executeTaskNodesConcurrently(
 	if anyFailed {
 		s.markInstanceFailed(ctx, inst)
 	}
+	s.syncUnstartedNodeInstancesEnv(ctx, inst, nodes, nodeInstMap)
 }
 
 // runTaskScripts 按顺序执行 start_script / pre_script / script / post_script。
-// 在独立 goroutine 中运行，只读取传入的环境快照并写入本地副本，
-// 导出的环境变量通过返回值交由调用方串行合并。
+// 在独立 goroutine 中运行，只读取传入的环境快照并写入本地副本；
+// 全局 env 在节点整体成功返回后由调用方 mergeExportedEnv。
 func (s *Scheduler) runTaskScripts(
 	ctx context.Context,
 	exec executor.Executor,
+	inst *entity.FlowInstance,
 	n *entity.Node,
-	instanceID int64,
 	ni *entity.NodeInstance,
 	baseEnv map[string]string,
 ) taskRunResult {
@@ -713,7 +848,13 @@ func (s *Scheduler) runTaskScripts(
 	for k, v := range baseEnv {
 		env[k] = v
 	}
-	env[executor.EnvOutFileKey] = s.envOutPath(instanceID, ni.NodeID)
+	env["INSTANCE_ID"] = fmt.Sprintf("%d", inst.ID)
+	env["NODE_ID"] = fmt.Sprintf("%d", n.ID)
+	env["NODE_NAME"] = n.Name
+	if len(n.Owners) > 0 {
+		env["NODE_OWNER"] = strings.Join(n.Owners, ",")
+	}
+	env[executor.EnvOutFileKey] = s.envOutPath(inst, ni.NodeID)
 	exported := map[string]string{}
 	merge := func(e map[string]string) {
 		for k, v := range e {
@@ -723,7 +864,7 @@ func (s *Scheduler) runTaskScripts(
 	}
 
 	if n.StartScript != "" {
-		result, err := exec.Execute(ctx, executor.ExecuteSpec{InstanceID: instanceID, Command: n.StartScript, Env: env})
+		result, err := exec.Execute(ctx, s.buildExecuteSpec(n, inst.ID, n.StartScript, env))
 		if err != nil {
 			s.logger.Error("start script execution failed", "node_id", n.ID, "error", err)
 			return taskRunResult{skipped: true, exportedEnv: exported}
@@ -746,7 +887,7 @@ func (s *Scheduler) runTaskScripts(
 		if spt.content == "" {
 			continue
 		}
-		result, err := exec.Execute(ctx, executor.ExecuteSpec{InstanceID: instanceID, Command: spt.content, Env: env})
+		result, err := exec.Execute(ctx, s.buildExecuteSpec(n, inst.ID, spt.content, env))
 		if err != nil {
 			s.logger.Error("script execution error", "node_id", n.ID, "script", spt.name, "error", err)
 			return taskRunResult{exportedEnv: exported}

@@ -9,6 +9,8 @@ type ConfigTabProps = {
   loading?: boolean
   isNew?: boolean
   templateId?: number | null
+  saving?: boolean
+  onSave?: () => void | Promise<void>
 }
 
 const paramTypeOptions = [
@@ -27,7 +29,15 @@ export function randomWebhookSecret(): string {
 
 const PARAM_GRID = '1.2fr 0.8fr 1fr 72px 1.4fr 32px'
 
-export default function ConfigTab({ form, notifyTemplates, loading, isNew, templateId }: ConfigTabProps) {
+export default function ConfigTab({
+  form,
+  notifyTemplates,
+  loading,
+  isNew,
+  templateId,
+  saving,
+  onSave,
+}: ConfigTabProps) {
   const webhookEnabled = Form.useWatch('webhook', form)
   const cronEnabled = Form.useWatch('cron', form)
   const cronExpr = Form.useWatch('cron_expr', form)
@@ -51,7 +61,23 @@ export default function ConfigTab({ form, notifyTemplates, loading, isNew, templ
     : ''
 
   return (
-    <Form form={form} layout="vertical" disabled={loading}>
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }}>
+      <div style={{ flex: 1, overflowY: 'auto', minHeight: 0 }}>
+        <Form
+          form={form}
+          layout="vertical"
+          disabled={loading}
+          initialValues={{
+            manual: true,
+            webhook: false,
+            cron: false,
+            cron_expr: '',
+            require_params: false,
+            params: [],
+            owners: [],
+            notify_timings: [],
+          }}
+        >
       <Card title="基本信息" size="small">
         <Form.Item label="流水线名称" name="name" rules={[{ required: true, message: '请输入名称' }]}>
           <Input placeholder="请输入流水线名称" />
@@ -169,7 +195,23 @@ export default function ConfigTab({ form, notifyTemplates, loading, isNew, templ
           />
         </Form.Item>
       </Card>
-    </Form>
+        </Form>
+      </div>
+      <div
+        style={{
+          flexShrink: 0,
+          display: 'flex',
+          justifyContent: 'center',
+          padding: '12px 16px',
+          borderTop: '1px solid #f0f0f0',
+          background: '#fff',
+        }}
+      >
+        <Button type="primary" loading={saving} disabled={loading} onClick={() => void onSave?.()}>
+          保存
+        </Button>
+      </div>
+    </div>
   )
 }
 

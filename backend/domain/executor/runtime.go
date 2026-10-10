@@ -27,12 +27,25 @@ type SSHConfig struct {
 
 // K8sConfig 描述一个 k8s 集群执行资源。
 type K8sConfig struct {
-	// Kubeconfig 为 kubeconfig 文件内容（YAML），从中解析 server / 凭证 / CA。
 	Kubeconfig string `json:"kubeconfig"`
-	// Namespace 为 Pod 运行命名空间。
-	Namespace string `json:"namespace"`
-	// Image 为执行镜像，脚本在其中运行；为空时使用默认镜像。
-	Image string `json:"image"`
+	Server     string `json:"server"`
+	Token      string `json:"token"`
+	Namespace  string `json:"namespace"`
+	Image      string `json:"image"`
+}
+
+// PodVolume 与 PodVolumeMount 用于构造 Pod spec。
+type PodVolume struct {
+	Name   string `json:"name"`
+	Type   string `json:"type"`
+	Source string `json:"source,omitempty"`
+}
+
+type PodVolumeMount struct {
+	Name      string `json:"name"`
+	MountPath string `json:"mount_path"`
+	SubPath   string `json:"sub_path,omitempty"`
+	ReadOnly  bool   `json:"read_only,omitempty"`
 }
 
 // ValidRuntimeKind 判断运行时类型是否合法。

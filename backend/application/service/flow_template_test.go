@@ -85,6 +85,14 @@ func (m *mockVersionRepo) ListByTemplate(ctx context.Context, templateID int64) 
 	return args.Get(0).([]*entity.FlowTemplateVersion), args.Error(1)
 }
 
+func (m *mockVersionRepo) ListPublishedCronTriggers(ctx context.Context) ([]entity.PublishedCronRule, error) {
+	args := m.Called(ctx)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]entity.PublishedCronRule), args.Error(1)
+}
+
 func (m *mockVersionRepo) Update(ctx context.Context, ver *entity.FlowTemplateVersion) error {
 	args := m.Called(ctx, ver)
 	return args.Error(0)
@@ -147,7 +155,10 @@ func TestFlowTemplateServiceCreate(t *testing.T) {
 	})
 
 	vRepo := new(mockVersionRepo)
-	vRepo.On("Create", mock.Anything, mock.AnythingOfType("*entity.FlowTemplateVersion")).Return(nil)
+	vRepo.On("Create", mock.Anything, mock.AnythingOfType("*entity.FlowTemplateVersion")).Return(nil).Run(func(args mock.Arguments) {
+		ver := args.Get(1).(*entity.FlowTemplateVersion)
+		ver.ID = 1
+	})
 
 	svc := newTestFlowTemplateService(repo, vRepo)
 	resp, err := svc.Create(context.Background(), dto.CreateFlowTemplateRequest{Name: "build"})

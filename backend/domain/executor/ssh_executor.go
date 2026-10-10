@@ -124,6 +124,8 @@ func (e *SSHExecutor) Execute(ctx context.Context, spec ExecuteSpec) (ExecuteRes
 		fmt.Fprintf(&b, "export %s=%s\n", k, shellQuote(v))
 	}
 	fmt.Fprintf(&b, "export %s=%s\n", EnvOutFileKey, shellQuote(envOut))
+	b.WriteString(ShellInitEnvOutSnippet())
+	b.WriteString("\n")
 	b.WriteString(spec.Command)
 	b.WriteString("\n")
 	fmt.Fprintf(&b, "__flow_rc=$?\n")

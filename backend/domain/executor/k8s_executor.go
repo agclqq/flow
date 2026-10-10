@@ -31,38 +31,8 @@ type K8sExecutor struct {
 
 // NewK8sExecutor 解析 kubeconfig 并构造 k8s 执行器。
 func NewK8sExecutor(cfg K8sConfig) (*K8sExecutor, error) {
-	if strings.TrimSpace(cfg.Kubeconfig) == "" {
-		return nil, fmt.Errorf("k8s resource requires kubeconfig")
-	}
-	var kc kubeconfigFile
-	if err := yaml.Unmarshal([]byte(cfg.Kubeconfig), &kc); err != nil {
-		return nil, fmt.Errorf("parse kubeconfig: %w", err)
-	}
-	ctxName := kc.CurrentContext
-	if ctxName == "" && len(kc.Contexts) > 0 {
-		ctxName = kc.Contexts[0].Name
-	}
-	var clusterRef, userRef string
-	for _, c := range kc.Contexts {
-		if c.Name == ctxName {
-			clusterRef, userRef = c.Context.Cluster, c.Context.User
-			break
-		}
-	}
-	var cluster *kubeCluster
-	for i := range kc.Clusters {
-		if kc.Clusters[i].Name == clusterRef {
-			cluster = &kc.Clusters[i].Cluster
-			break
-		}
-	}
-	if cluster == nil || cluster.Server == "" {
-		return nil, fmt.Errorf("kubeconfig has no usable cluster server")
-	}
-
 	e := &K8sExecutor{
 		cfg:       cfg,
-		server:    strings.TrimSuffix(cluster.Server, "/"),
 		namespace: cfg.Namespace,
 		image:     cfg.Image,
 	}
@@ -73,34 +43,70 @@ func NewK8sExecutor(cfg K8sConfig) (*K8sExecutor, error) {
 		e.image = "busybox:1.36"
 	}
 
-	tlsCfg := &tls.Config{InsecureSkipVerify: cluster.InsecureSkipTLSVerify}
-	if caData := decodeB64(cluster.CertificateAuthorityData); len(caData) > 0 {
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(caData) {
-			return nil, fmt.Errorf("kubeconfig certificate-authority-data is invalid")
+	tlsCfg := &tls.Config{}
+
+	if strings.TrimSpace(cfg.Kubeconfig) != "" {
+		var kc kubeconfigFile
+		if err := yaml.Unmarshal([]byte(cfg.Kubeconfig), &kc); err != nil {
+			return nil, fmt.Errorf("parse kubeconfig: %w", err)
 		}
-		tlsCfg.RootCAs = pool
+		ctxName := kc.CurrentContext
+		if ctxName == "" && len(kc.Contexts) > 0 {
+			ctxName = kc.Contexts[0].Name
+		}
+		var clusterRef, userRef string
+		for _, c := range kc.Contexts {
+			if c.Name == ctxName {
+				clusterRef, userRef = c.Context.Cluster, c.Context.User
+				break
+			}
+		}
+		var cluster *kubeCluster
+		for i := range kc.Clusters {
+			if kc.Clusters[i].Name == clusterRef {
+				cluster = &kc.Clusters[i].Cluster
+				break
+			}
+		}
+		if cluster == nil || cluster.Server == "" {
+			return nil, fmt.Errorf("kubeconfig has no usable cluster server")
+		}
+		e.server = strings.TrimSuffix(cluster.Server, "/")
+		tlsCfg.InsecureSkipVerify = cluster.InsecureSkipTLSVerify
+		if caData := decodeB64(cluster.CertificateAuthorityData); len(caData) > 0 {
+			pool := x509.NewCertPool()
+			if !pool.AppendCertsFromPEM(caData) {
+				return nil, fmt.Errorf("kubeconfig certificate-authority-data is invalid")
+			}
+			tlsCfg.RootCAs = pool
+		}
+		var user *kubeUser
+		for i := range kc.Users {
+			if kc.Users[i].Name == userRef {
+				user = &kc.Users[i].User
+				break
+			}
+		}
+		if user != nil {
+			e.token = user.Token
+			e.username, e.password = user.Username, user.Password
+			certData, keyData := decodeB64(user.ClientCertificateData), decodeB64(user.ClientKeyData)
+			if len(certData) > 0 && len(keyData) > 0 {
+				pair, err := tls.X509KeyPair(certData, keyData)
+				if err != nil {
+					return nil, fmt.Errorf("kubeconfig client certificate is invalid: %w", err)
+				}
+				tlsCfg.Certificates = []tls.Certificate{pair}
+			}
+		}
+	} else if strings.TrimSpace(cfg.Server) != "" && strings.TrimSpace(cfg.Token) != "" {
+		e.server = strings.TrimSuffix(strings.TrimSpace(cfg.Server), "/")
+		e.token = strings.TrimSpace(cfg.Token)
+		tlsCfg.InsecureSkipVerify = true
+	} else {
+		return nil, fmt.Errorf("k8s resource requires kubeconfig or server+token")
 	}
 
-	var user *kubeUser
-	for i := range kc.Users {
-		if kc.Users[i].Name == userRef {
-			user = &kc.Users[i].User
-			break
-		}
-	}
-	if user != nil {
-		e.token = user.Token
-		e.username, e.password = user.Username, user.Password
-		certData, keyData := decodeB64(user.ClientCertificateData), decodeB64(user.ClientKeyData)
-		if len(certData) > 0 && len(keyData) > 0 {
-			pair, err := tls.X509KeyPair(certData, keyData)
-			if err != nil {
-				return nil, fmt.Errorf("kubeconfig client certificate is invalid: %w", err)
-			}
-			tlsCfg.Certificates = []tls.Certificate{pair}
-		}
-	}
 	e.http = &http.Client{Transport: &http.Transport{TLSClientConfig: tlsCfg}, Timeout: 30 * time.Second}
 	return e, nil
 }
@@ -219,6 +225,7 @@ func (e *K8sExecutor) Execute(ctx context.Context, spec ExecuteSpec) (ExecuteRes
 	}
 
 	wrapper := strings.Join([]string{
+		ShellInitEnvOutSnippet(),
 		spec.Command,
 		"__flow_rc=$?",
 		"echo " + envBeginMarker,
@@ -227,6 +234,27 @@ func (e *K8sExecutor) Execute(ctx context.Context, spec ExecuteSpec) (ExecuteRes
 		"exit $__flow_rc",
 	}, "\n")
 
+	volumes, mounts := buildPodVolumes(spec.Volumes, spec.VolumeMounts)
+	container := map[string]any{
+		"name":            "main",
+		"image":           image,
+		"command":         []string{"sh", "-c", wrapper},
+		"env":             envList,
+		"imagePullPolicy": "IfNotPresent",
+	}
+	if len(mounts) > 0 {
+		container["volumeMounts"] = mounts
+	}
+	if res := buildContainerResources(spec.Resources); res != nil {
+		container["resources"] = res
+	}
+	podSpec := map[string]any{
+		"restartPolicy": "Never",
+		"containers":    []map[string]any{container},
+	}
+	if len(volumes) > 0 {
+		podSpec["volumes"] = volumes
+	}
 	pod := map[string]any{
 		"apiVersion": "v1",
 		"kind":       "Pod",
@@ -234,16 +262,7 @@ func (e *K8sExecutor) Execute(ctx context.Context, spec ExecuteSpec) (ExecuteRes
 			"name":   podName,
 			"labels": map[string]string{"app": "flow-runner"},
 		},
-		"spec": map[string]any{
-			"restartPolicy": "Never",
-			"containers": []map[string]any{{
-				"name":            "main",
-				"image":           image,
-				"command":         []string{"sh", "-c", wrapper},
-				"env":             envList,
-				"imagePullPolicy": "IfNotPresent",
-			}},
-		},
+		"spec": podSpec,
 	}
 
 	if _, err := e.do(ctx, http.MethodPost, fmt.Sprintf("/api/v1/namespaces/%s/pods", e.namespace), pod); err != nil {
@@ -297,4 +316,59 @@ func (e *K8sExecutor) Execute(ctx context.Context, spec ExecuteSpec) (ExecuteRes
 		exported, output := extractEnvBlock(string(logData))
 		return ExecuteResult{ExitCode: exitCode, Output: output, ExportedEnv: exported}, nil
 	}
+}
+
+func buildPodVolumes(vols []PodVolume, mounts []PodVolumeMount) ([]map[string]any, []map[string]any) {
+	if len(vols) == 0 {
+		return nil, nil
+	}
+	volumeDefs := make([]map[string]any, 0, len(vols))
+	for _, vol := range vols {
+		if vol.Name == "" {
+			continue
+		}
+		item := map[string]any{"name": vol.Name}
+		switch strings.ToLower(vol.Type) {
+		case "hostpath", "host_path":
+			item["hostPath"] = map[string]any{"path": vol.Source}
+		case "configmap", "config_map":
+			item["configMap"] = map[string]any{"name": vol.Source}
+		case "secret":
+			item["secret"] = map[string]any{"secretName": vol.Source}
+		case "pvc", "persistentvolumeclaim":
+			item["persistentVolumeClaim"] = map[string]any{"claimName": vol.Source}
+		default:
+			item["emptyDir"] = map[string]any{}
+		}
+		volumeDefs = append(volumeDefs, item)
+	}
+	mountDefs := make([]map[string]any, 0, len(mounts))
+	for _, m := range mounts {
+		if m.Name == "" || m.MountPath == "" {
+			continue
+		}
+		item := map[string]any{"name": m.Name, "mountPath": m.MountPath}
+		if m.SubPath != "" {
+			item["subPath"] = m.SubPath
+		}
+		if m.ReadOnly {
+			item["readOnly"] = true
+		}
+		mountDefs = append(mountDefs, item)
+	}
+	return volumeDefs, mountDefs
+}
+
+func buildContainerResources(r ContainerResources) map[string]any {
+	if len(r.Requests) == 0 && len(r.Limits) == 0 {
+		return nil
+	}
+	out := map[string]any{}
+	if len(r.Requests) > 0 {
+		out["requests"] = r.Requests
+	}
+	if len(r.Limits) > 0 {
+		out["limits"] = r.Limits
+	}
+	return out
 }

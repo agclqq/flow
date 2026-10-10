@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"flow/application/dto"
 	"flow/domain/entity"
@@ -172,6 +173,12 @@ func copyVersionContent(
 		copyNode.PositionY = cloneFloat64Ptr(n.PositionY)
 		copyNode.RuntimeKind = n.RuntimeKind
 		copyNode.ResourceID = n.ResourceID
+		copyNode.K8sAuthID = n.K8sAuthID
+		copyNode.K8sNamespace = n.K8sNamespace
+		copyNode.K8sImage = n.K8sImage
+		copyNode.K8sVolumes = append([]entity.K8sVolume(nil), n.K8sVolumes...)
+		copyNode.K8sVolumeMounts = append([]entity.K8sVolumeMount(nil), n.K8sVolumeMounts...)
+		copyNode.K8sResources = cloneK8sResources(n.K8sResources)
 		if err := nodeRepo.Create(ctx, copyNode); err != nil {
 			return err
 		}
@@ -508,18 +515,8 @@ func (s *VersionService) buildNodeFromRequest(templateID, versionID int64, req d
 		node.PositionX = req.PositionX
 		node.PositionY = req.PositionY
 	}
-	// 执行资源：默认本地（调试）；ssh/k8s 必须引用已登记的资源 ID。
-	switch req.RuntimeKind {
-	case "", executor.RuntimeKindLocal:
-		node.RuntimeKind = executor.RuntimeKindLocal
-	case executor.RuntimeKindSSH, executor.RuntimeKindK8s:
-		if req.ResourceID == 0 {
-			return nil, fmt.Errorf("%s runtime requires resource_id", req.RuntimeKind)
-		}
-		node.RuntimeKind = req.RuntimeKind
-		node.ResourceID = req.ResourceID
-	default:
-		return nil, fmt.Errorf("unknown runtime kind: %s", req.RuntimeKind)
+	if err := applyNodeRuntime(node, req.RuntimeKind, req.ResourceID, req.K8sAuthID, req.K8sNamespace, req.K8sImage, req.K8sVolumes, req.K8sVolumeMounts, req.K8sResources); err != nil {
+		return nil, err
 	}
 	if nodeType == valueobject.NodeTypeStart || nodeType == valueobject.NodeTypeEnd {
 		sanitizeTerminalNode(node)
@@ -687,6 +684,7 @@ func (s *VersionService) UpsertTrigger(ctx context.Context, templateID int64, re
 	cfg.Cron = req.Cron
 	cfg.CronExpr = req.CronExpr
 	cfg.RequireParams = req.RequireParams
+	cfg.WebhookSecret = req.WebhookSecret
 
 	if err := s.triggerRepo.Create(ctx, cfg); err != nil {
 		return nil, err
@@ -712,4 +710,113 @@ func (s *VersionService) GetTrigger(ctx context.Context, templateID int64) (*dto
 	}
 	resp := dto.ToTriggerConfigResponse(cfg)
 	return &resp, nil
+}
+
+func applyNodeRuntime(
+	node *entity.Node,
+	runtimeKind string,
+	resourceID, k8sAuthID int64,
+	k8sNamespace, k8sImage string,
+	k8sVolumes []dto.K8sVolumeDTO,
+	k8sMounts []dto.K8sVolumeMountDTO,
+	k8sResources dto.K8sResourceRequirementsDTO,
+) error {
+	switch runtimeKind {
+	case "", executor.RuntimeKindLocal:
+		node.RuntimeKind = executor.RuntimeKindLocal
+		node.ResourceID = 0
+		node.K8sAuthID = 0
+		node.K8sNamespace = ""
+		node.K8sImage = ""
+		node.K8sVolumes = nil
+		node.K8sVolumeMounts = nil
+		node.K8sResources = entity.K8sResourceRequirements{}
+		return nil
+	case executor.RuntimeKindSSH:
+		if resourceID == 0 {
+			return fmt.Errorf("ssh runtime requires resource_id")
+		}
+		node.RuntimeKind = executor.RuntimeKindSSH
+		node.ResourceID = resourceID
+		return nil
+	case executor.RuntimeKindK8s:
+		node.RuntimeKind = executor.RuntimeKindK8s
+		node.K8sNamespace = strings.TrimSpace(k8sNamespace)
+		node.K8sImage = strings.TrimSpace(k8sImage)
+		node.K8sVolumes = k8sVolumesFromDTO(k8sVolumes)
+		node.K8sVolumeMounts = k8sMountsFromDTO(k8sMounts)
+		node.K8sResources = k8sResourcesFromDTO(k8sResources)
+		if k8sAuthID > 0 {
+			node.K8sAuthID = k8sAuthID
+			node.ResourceID = 0
+		} else if resourceID > 0 {
+			node.ResourceID = resourceID
+			node.K8sAuthID = 0
+		} else {
+			return fmt.Errorf("k8s runtime requires k8s_auth_id")
+		}
+		if node.K8sImage == "" {
+			return fmt.Errorf("k8s runtime requires k8s_image")
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown runtime kind: %s", runtimeKind)
+	}
+}
+
+func k8sVolumesFromDTO(items []dto.K8sVolumeDTO) []entity.K8sVolume {
+	if len(items) == 0 {
+		return []entity.K8sVolume{}
+	}
+	out := make([]entity.K8sVolume, 0, len(items))
+	for _, item := range items {
+		out = append(out, entity.K8sVolume{Name: item.Name, Type: item.Type, Source: item.Source})
+	}
+	return out
+}
+
+func k8sMountsFromDTO(items []dto.K8sVolumeMountDTO) []entity.K8sVolumeMount {
+	if len(items) == 0 {
+		return []entity.K8sVolumeMount{}
+	}
+	out := make([]entity.K8sVolumeMount, 0, len(items))
+	for _, item := range items {
+		out = append(out, entity.K8sVolumeMount{
+			Name: item.Name, MountPath: item.MountPath, SubPath: item.SubPath, ReadOnly: item.ReadOnly,
+		})
+	}
+	return out
+}
+
+func k8sResourcesFromDTO(r dto.K8sResourceRequirementsDTO) entity.K8sResourceRequirements {
+	out := entity.K8sResourceRequirements{
+		Requests: normalizeResourceMap(r.Requests),
+		Limits:   normalizeResourceMap(r.Limits),
+	}
+	return out
+}
+
+func normalizeResourceMap(m map[string]string) map[string]string {
+	if len(m) == 0 {
+		return map[string]string{}
+	}
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		key := strings.TrimSpace(k)
+		val := strings.TrimSpace(v)
+		if key != "" && val != "" {
+			out[key] = val
+		}
+	}
+	if len(out) == 0 {
+		return map[string]string{}
+	}
+	return out
+}
+
+func cloneK8sResources(r entity.K8sResourceRequirements) entity.K8sResourceRequirements {
+	return entity.K8sResourceRequirements{
+		Requests: normalizeResourceMap(r.Requests),
+		Limits:   normalizeResourceMap(r.Limits),
+	}
 }

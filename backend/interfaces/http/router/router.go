@@ -17,6 +17,7 @@ type Services struct {
 	Instance *service.FlowInstanceService
 	Notify   *service.NotifyService
 	Resource *service.ExecutorResourceService
+	K8sConfig *service.K8sConfigService
 }
 
 // New 组装 gin 引擎与全部路由。
@@ -29,6 +30,7 @@ func New(svc *Services, logger *slog.Logger) *gin.Engine {
 	instHandler := handler.NewInstanceHandler(svc.Instance)
 	notifyHandler := handler.NewNotifyHandler(svc.Notify)
 	resourceHandler := handler.NewExecutorResourceHandler(svc.Resource)
+	k8sHandler := handler.NewK8sConfigHandler(svc.K8sConfig)
 
 	api := r.Group("/api/v1")
 	{
@@ -48,6 +50,11 @@ func New(svc *Services, logger *slog.Logger) *gin.Engine {
 		api.GET("/executor-resources/:id", resourceHandler.Get)
 		api.PUT("/executor-resources/:id", resourceHandler.Update)
 		api.DELETE("/executor-resources/:id", resourceHandler.Delete)
+
+		api.GET("/k8s-configs", k8sHandler.List)
+		api.POST("/k8s-configs", k8sHandler.Create)
+		api.PUT("/k8s-configs/:id", k8sHandler.Update)
+		api.DELETE("/k8s-configs/:id", k8sHandler.Delete)
 
 		templates := api.Group("/flow-templates")
 		{

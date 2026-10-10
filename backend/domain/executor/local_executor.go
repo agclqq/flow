@@ -35,8 +35,10 @@ func (e *LocalExecutor) Execute(ctx context.Context, spec ExecuteSpec) (ExecuteR
 		if err := os.MkdirAll(filepath.Dir(envOutPath), 0o755); err != nil {
 			return ExecuteResult{}, fmt.Errorf("create env out dir: %w", err)
 		}
-		if err := os.WriteFile(envOutPath, nil, 0o644); err != nil {
-			return ExecuteResult{}, fmt.Errorf("init env out file: %w", err)
+		if _, err := os.Stat(envOutPath); os.IsNotExist(err) {
+			if err := os.WriteFile(envOutPath, nil, 0o644); err != nil {
+				return ExecuteResult{}, fmt.Errorf("init env out file: %w", err)
+			}
 		}
 	}
 

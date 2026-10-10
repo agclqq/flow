@@ -82,7 +82,7 @@ function NodeExtendAdd({ onClick }: { onClick: (event: React.MouseEvent) => void
         }}
         onClick={(event) => {
           event.stopPropagation()
-          onClick()
+          onClick(event)
         }}
         style={addButtonStyle}
       >

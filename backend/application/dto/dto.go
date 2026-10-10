@@ -162,9 +162,34 @@ type CreateNodeRequest struct {
 	// DAG 画布坐标
 	PositionX *float64 `json:"position_x"`
 	PositionY *float64 `json:"position_y"`
-	// 执行资源：runtime_kind = local / ssh / k8s，resource_id 引用执行资源。
+	// 执行资源：runtime_kind = local / ssh / k8s。
 	RuntimeKind string `json:"runtime_kind"`
 	ResourceID  int64  `json:"resource_id"`
+	// K8s 运行时：认证、镜像与挂载（runtime_kind=k8s）。
+	K8sAuthID       int64  `json:"k8s_auth_id"`
+	K8sNamespace    string `json:"k8s_namespace"`
+	K8sImage        string `json:"k8s_image"`
+	K8sVolumes      []K8sVolumeDTO           `json:"k8s_volumes"`
+	K8sVolumeMounts []K8sVolumeMountDTO      `json:"k8s_volume_mounts"`
+	K8sResources    K8sResourceRequirementsDTO `json:"k8s_resources"`
+}
+
+type K8sResourceRequirementsDTO struct {
+	Requests map[string]string `json:"requests"`
+	Limits   map[string]string `json:"limits"`
+}
+
+type K8sVolumeDTO struct {
+	Name   string `json:"name"`
+	Type   string `json:"type"`
+	Source string `json:"source,omitempty"`
+}
+
+type K8sVolumeMountDTO struct {
+	Name      string `json:"name"`
+	MountPath string `json:"mount_path"`
+	SubPath   string `json:"sub_path,omitempty"`
+	ReadOnly  bool   `json:"read_only,omitempty"`
 }
 
 type UpdateNodeRequest struct {
@@ -209,6 +234,31 @@ type NodeResponse struct {
 	PositionY              *float64 `json:"position_y"`
 	RuntimeKind            string   `json:"runtime_kind"`
 	ResourceID             int64    `json:"resource_id"`
+	K8sAuthID              int64    `json:"k8s_auth_id"`
+	K8sNamespace           string   `json:"k8s_namespace"`
+	K8sImage               string   `json:"k8s_image"`
+	K8sVolumes             []K8sVolumeDTO               `json:"k8s_volumes"`
+	K8sVolumeMounts        []K8sVolumeMountDTO          `json:"k8s_volume_mounts"`
+	K8sResources           K8sResourceRequirementsDTO   `json:"k8s_resources"`
+}
+
+type UpsertK8sConfigRequest struct {
+	Name       string `json:"name" binding:"required"`
+	Server     string `json:"server"`
+	Token      string `json:"token"`
+	Kubeconfig string `json:"kubeconfig"`
+	Namespace  string `json:"namespace"`
+}
+
+type K8sConfigResponse struct {
+	ID         int64     `json:"id"`
+	Name       string    `json:"name"`
+	Server     string    `json:"server"`
+	Token      string    `json:"token"`
+	Kubeconfig string    `json:"kubeconfig"`
+	Namespace  string    `json:"namespace"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
 }
 
 func ToNodeResponse(n *entity.Node) NodeResponse {
@@ -241,7 +291,52 @@ func ToNodeResponse(n *entity.Node) NodeResponse {
 		PositionY:       n.PositionY,
 		RuntimeKind:     n.RuntimeKind,
 		ResourceID:      n.ResourceID,
+		K8sAuthID:       n.K8sAuthID,
+		K8sNamespace:    n.K8sNamespace,
+		K8sImage:        n.K8sImage,
+		K8sVolumes:      toK8sVolumeDTOs(n.K8sVolumes),
+		K8sVolumeMounts: toK8sVolumeMountDTOs(n.K8sVolumeMounts),
+		K8sResources:    toK8sResourcesDTO(n.K8sResources),
 	}
+}
+
+func toK8sResourcesDTO(r entity.K8sResourceRequirements) K8sResourceRequirementsDTO {
+	req := r.Requests
+	if req == nil {
+		req = map[string]string{}
+	}
+	lim := r.Limits
+	if lim == nil {
+		lim = map[string]string{}
+	}
+	return K8sResourceRequirementsDTO{Requests: req, Limits: lim}
+}
+
+func toK8sVolumeDTOs(items []entity.K8sVolume) []K8sVolumeDTO {
+	if len(items) == 0 {
+		return []K8sVolumeDTO{}
+	}
+	out := make([]K8sVolumeDTO, 0, len(items))
+	for _, item := range items {
+		out = append(out, K8sVolumeDTO{Name: item.Name, Type: item.Type, Source: item.Source})
+	}
+	return out
+}
+
+func toK8sVolumeMountDTOs(items []entity.K8sVolumeMount) []K8sVolumeMountDTO {
+	if len(items) == 0 {
+		return []K8sVolumeMountDTO{}
+	}
+	out := make([]K8sVolumeMountDTO, 0, len(items))
+	for _, item := range items {
+		out = append(out, K8sVolumeMountDTO{
+			Name:      item.Name,
+			MountPath: item.MountPath,
+			SubPath:   item.SubPath,
+			ReadOnly:  item.ReadOnly,
+		})
+	}
+	return out
 }
 
 // --- FlowParam DTOs ---
@@ -405,15 +500,48 @@ func ToInstanceResponse(inst *entity.FlowInstance) FlowInstanceResponse {
 	if len(inst.NodeInstances) > 0 {
 		nis := make([]NodeInstanceResponse, 0, len(inst.NodeInstances))
 		for _, ni := range inst.NodeInstances {
-			nis = append(nis, ToNodeInstanceResponse(ni))
+			nis = append(nis, ToNodeInstanceResponse(ni, env))
 		}
 		resp.NodeInstances = nis
 	}
 	return resp
 }
 
-func ToNodeInstanceResponse(ni *entity.NodeInstance) NodeInstanceResponse {
-	env := ni.Env
+// nodeLocalEnvKeys 为节点级注入变量，展示时不被实例 env 覆盖。
+var nodeLocalEnvKeys = []string{"FLOW_ENV_OUT", "NODE_ID", "NODE_NAME", "NODE_OWNER"}
+
+func overlayInstanceEnvForNode(ni *entity.NodeInstance, instEnv map[string]string) map[string]string {
+	if instEnv == nil || len(instEnv) == 0 {
+		return ni.Env
+	}
+	switch ni.Status {
+	case valueobject.NodeInstanceStatusPending,
+		valueobject.NodeInstanceStatusWaitingApproval,
+		valueobject.NodeInstanceStatusRetrying:
+	default:
+		return ni.Env
+	}
+	base := ni.Env
+	if base == nil {
+		base = map[string]string{}
+	}
+	out := make(map[string]string, len(base)+len(instEnv))
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, v := range instEnv {
+		out[k] = v
+	}
+	for _, k := range nodeLocalEnvKeys {
+		if v, ok := base[k]; ok {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+func ToNodeInstanceResponse(ni *entity.NodeInstance, instEnv map[string]string) NodeInstanceResponse {
+	env := overlayInstanceEnvForNode(ni, instEnv)
 	if env == nil {
 		env = map[string]string{}
 	}

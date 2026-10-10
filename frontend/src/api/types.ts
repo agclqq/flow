@@ -63,9 +63,52 @@ export type FlowNode = {
   required_predecessor_ids?: number[]
   position_x?: number | null
   position_y?: number | null
-  // 执行资源：runtime_kind = local / ssh / k8s，resource_id 引用执行资源。
+  // 执行资源：runtime_kind = local / ssh / k8s。
   runtime_kind?: string
   resource_id?: number
+  k8s_auth_id?: number
+  k8s_namespace?: string
+  k8s_image?: string
+  k8s_volumes?: K8sVolume[]
+  k8s_volume_mounts?: K8sVolumeMount[]
+  k8s_resources?: K8sResources
+}
+
+export type K8sResources = {
+  requests?: Record<string, string>
+  limits?: Record<string, string>
+}
+
+export type K8sVolume = {
+  name: string
+  type: 'emptyDir' | 'hostPath' | 'configMap' | 'secret' | 'pvc' | string
+  source?: string
+}
+
+export type K8sVolumeMount = {
+  name: string
+  mount_path: string
+  sub_path?: string
+  read_only?: boolean
+}
+
+export type K8sConfig = {
+  id: number
+  name: string
+  server: string
+  token: string
+  kubeconfig: string
+  namespace: string
+  created_at: string
+  updated_at: string
+}
+
+export type UpsertK8sConfigRequest = {
+  name: string
+  server?: string
+  token?: string
+  kubeconfig?: string
+  namespace?: string
 }
 
 export type VersionListItem = {
@@ -176,6 +219,12 @@ export type GraphNodePayload = {
   required_predecessor_ids?: number[]
   runtime_kind?: string
   resource_id?: number
+  k8s_auth_id?: number
+  k8s_namespace?: string
+  k8s_image?: string
+  k8s_volumes?: K8sVolume[]
+  k8s_volume_mounts?: K8sVolumeMount[]
+  k8s_resources?: K8sResources
 }
 
 export type GraphEdgePayload = {

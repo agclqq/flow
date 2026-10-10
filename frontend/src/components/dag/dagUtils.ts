@@ -1,5 +1,71 @@
 import type { Edge, Node } from '@xyflow/react'
-import type { FlowNode, GraphEdgePayload, GraphNodePayload, NodeInstance } from '../../api/types'
+import type { FlowNode, GraphEdgePayload, GraphNodePayload, K8sResources, NodeInstance } from '../../api/types'
+
+/** K8s 扩展资源名：NVIDIA GPU（requests/limits 键）。 */
+export const K8S_GPU_RESOURCE = 'nvidia.com/gpu'
+
+const K8S_BUILTIN_RESOURCES = new Set(['cpu', 'memory', K8S_GPU_RESOURCE])
+
+function trimResourceEntry(key: string, value?: string) {
+  const k = key.trim()
+  const v = (value ?? '').trim()
+  if (!k || !v) return null
+  return { k, v }
+}
+
+/** 将节点 k8s_resources 展开为表单字段。 */
+export function k8sResourcesToFormFields(r?: K8sResources) {
+  const req = r?.requests ?? {}
+  const lim = r?.limits ?? {}
+  const names = new Set([...Object.keys(req), ...Object.keys(lim)])
+  const extra: { name: string; request?: string; limit?: string }[] = []
+  for (const name of names) {
+    if (K8S_BUILTIN_RESOURCES.has(name)) continue
+    extra.push({ name, request: req[name], limit: lim[name] })
+  }
+  return {
+    k8s_cpu_request: req.cpu ?? '',
+    k8s_cpu_limit: lim.cpu ?? '',
+    k8s_mem_request: req.memory ?? '',
+    k8s_mem_limit: lim.memory ?? '',
+    k8s_gpu_request: req[K8S_GPU_RESOURCE] ?? '',
+    k8s_gpu_limit: lim[K8S_GPU_RESOURCE] ?? '',
+    k8s_extra_resources: extra,
+  }
+}
+
+/** 从表单字段组装 k8s_resources（空则返回 undefined 便于 JSON 精简）。 */
+export function formFieldsToK8sResources(values: {
+  k8s_cpu_request?: string
+  k8s_cpu_limit?: string
+  k8s_mem_request?: string
+  k8s_mem_limit?: string
+  k8s_gpu_request?: string
+  k8s_gpu_limit?: string
+  k8s_extra_resources?: { name?: string; request?: string; limit?: string }[]
+}): K8sResources | undefined {
+  const requests: Record<string, string> = {}
+  const limits: Record<string, string> = {}
+  const put = (target: Record<string, string>, key: string, val?: string) => {
+    const e = trimResourceEntry(key, val)
+    if (e) target[e.k] = e.v
+  }
+  put(requests, 'cpu', values.k8s_cpu_request)
+  put(limits, 'cpu', values.k8s_cpu_limit)
+  put(requests, 'memory', values.k8s_mem_request)
+  put(limits, 'memory', values.k8s_mem_limit)
+  put(requests, K8S_GPU_RESOURCE, values.k8s_gpu_request)
+  put(limits, K8S_GPU_RESOURCE, values.k8s_gpu_limit)
+  for (const row of values.k8s_extra_resources ?? []) {
+    if (!row?.name?.trim()) continue
+    put(requests, row.name, row.request)
+    put(limits, row.name, row.limit)
+  }
+  if (Object.keys(requests).length === 0 && Object.keys(limits).length === 0) {
+    return undefined
+  }
+  return { requests, limits }
+}
 
 const VISUAL_TYPES = new Set(['task', 'join', 'manual', 'start', 'end'])
 
@@ -47,6 +113,12 @@ export function flowNodesToGraph(
       required_predecessor_ids: node.required_predecessor_ids ?? [],
       runtime_kind: node.runtime_kind || 'local',
       resource_id: node.resource_id ?? 0,
+      k8s_auth_id: node.k8s_auth_id ?? 0,
+      k8s_namespace: node.k8s_namespace ?? '',
+      k8s_image: node.k8s_image ?? '',
+      k8s_volumes: node.k8s_volumes ?? [],
+      k8s_volume_mounts: node.k8s_volume_mounts ?? [],
+      k8s_resources: node.k8s_resources,
     },
     deletable: node.type !== 'start' && node.type !== 'end',
   }))
@@ -152,6 +224,12 @@ function nodeConfigPayloadFromNode(node: Node): GraphNodePayload {
     required_predecessor_ids: (node.data.required_predecessor_ids as number[]) ?? [],
     runtime_kind: String(node.data.runtime_kind ?? 'local'),
     resource_id: Number(node.data.resource_id ?? 0),
+    k8s_auth_id: Number(node.data.k8s_auth_id ?? 0),
+    k8s_namespace: String(node.data.k8s_namespace ?? ''),
+    k8s_image: String(node.data.k8s_image ?? ''),
+    k8s_volumes: (node.data.k8s_volumes as GraphNodePayload['k8s_volumes']) ?? [],
+    k8s_volume_mounts: (node.data.k8s_volume_mounts as GraphNodePayload['k8s_volume_mounts']) ?? [],
+    k8s_resources: node.data.k8s_resources as GraphNodePayload['k8s_resources'],
   }
 }
 
@@ -214,11 +292,26 @@ export function mergeBackendIdsAfterTopologySave(
   }
 
   const nodes = currentNodes.map((node, index) => {
-    const backendId = savedNodes[index]?.id
-    if (!backendId || (node.data.backendId as number | undefined) === backendId) {
+    const savedNode = savedNodes[index]
+    const backendId = savedNode?.id
+    if (!backendId) {
       return node
     }
-    return { ...node, data: { ...node.data, backendId } }
+    const savedPreds = savedNode.required_predecessor_ids ?? []
+    const currentPreds = (node.data.required_predecessor_ids as number[]) ?? []
+    const predsEqual =
+      savedPreds.length === currentPreds.length && savedPreds.every((id, i) => id === currentPreds[i])
+    if ((node.data.backendId as number | undefined) === backendId && predsEqual) {
+      return node
+    }
+    return {
+      ...node,
+      data: {
+        ...node.data,
+        backendId,
+        required_predecessor_ids: savedPreds,
+      },
+    }
   })
 
   const edges = currentEdges.map((edge, index) => {

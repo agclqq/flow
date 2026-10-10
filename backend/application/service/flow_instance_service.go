@@ -56,8 +56,20 @@ func NewFlowInstanceService(
 	}
 }
 
+// FireCronForTemplate 在指定时间点触发单个模板的定时规则（含一分钟回看窗口）。
+func (s *FlowInstanceService) FireCronForTemplate(ctx context.Context, templateID int64, now time.Time) {
+	tpl, err := s.tplRepo.GetByID(ctx, templateID)
+	if err != nil {
+		s.logger.Error("cron fire load template failed", "template_id", templateID, "error", err)
+		return
+	}
+	minuteStart := now.Truncate(time.Minute)
+	lookback := []time.Time{minuteStart.Add(-time.Minute), minuteStart}
+	s.fireCronIfDue(ctx, tpl, lookback)
+}
+
 // RunDueCronInstances 扫描所有开启定时触发的模板，
-// 触发 [上一分钟, 本轮分钟] 窗口内到期的实例。由每分钟一次的扫描任务调用。
+// 触发 [上一分钟, 本轮分钟] 窗口内到期的实例。由 Leader 成为主节点时的 catch-up 调用。
 func (s *FlowInstanceService) RunDueCronInstances(ctx context.Context, now time.Time) {
 	minuteStart := now.Truncate(time.Minute)
 
@@ -243,19 +255,7 @@ func (s *FlowInstanceService) createAndRun(
 	if err != nil {
 		return nil, err
 	}
-	// 必填参数校验：请求中未提供的必填参数直接报错（手动/webhook/定时触发统一拦截）。
-	missing := make([]string, 0, len(declared))
-	for _, p := range declared {
-		if !p.Required {
-			continue
-		}
-		if v, ok := params[p.Name]; !ok || v == "" {
-			missing = append(missing, p.Name)
-		}
-	}
-	if len(missing) > 0 {
-		return nil, fmt.Errorf("缺少必填参数: %s", strings.Join(missing, ", "))
-	}
+	// 先补默认值/类型零值，再校验必填（定时触发无入参时也应能使用默认值启动）。
 	for _, p := range declared {
 		if _, ok := merged[p.Name]; ok {
 			continue
@@ -273,18 +273,33 @@ func (s *FlowInstanceService) createAndRun(
 			merged[p.Name] = ""
 		}
 	}
+	missing := make([]string, 0, len(declared))
+	for _, p := range declared {
+		if !p.Required {
+			continue
+		}
+		if v, ok := merged[p.Name]; !ok || v == "" {
+			missing = append(missing, p.Name)
+		}
+	}
+	if len(missing) > 0 {
+		return nil, fmt.Errorf("缺少必填参数: %s", strings.Join(missing, ", "))
+	}
 	inst.SetParams(merged)
 
-	// 注入实例级系统参数：脚本与实例详情均可引用（node_owner 为节点级，调度时单独注入）。
+	// 注入实例级系统参数：脚本与实例详情均可引用（NODE_* 为节点级，调度时单独注入）。
 	inst.UpdateEnv(map[string]string{
-		"template_id":    fmt.Sprintf("%d", tpl.ID),
-		"template_name":  tpl.Name,
-		"template_owner": strings.Join(tpl.Owners, ","),
+		"TEMPLATE_ID":    fmt.Sprintf("%d", tpl.ID),
+		"TEMPLATE_NAME":  tpl.Name,
+		"TEMPLATE_OWNER": strings.Join(tpl.Owners, ","),
 	})
 
 	if err := s.instRepo.Create(ctx, inst); err != nil {
 		return nil, err
 	}
+	inst.UpdateEnv(map[string]string{
+		"INSTANCE_ID": fmt.Sprintf("%d", inst.ID),
+	})
 
 	if err := inst.Transition(valueobject.FlowInstanceStatusRunning); err != nil {
 		return nil, err

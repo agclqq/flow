@@ -56,6 +56,13 @@ func (s *FlowTemplateService) Create(ctx context.Context, req dto.CreateFlowTemp
 	if err := s.versionRepo.Create(ctx, ver); err != nil {
 		return nil, err
 	}
+	startNode, err := entity.NewNode(tpl.ID, ver.ID, valueobject.NodeTypeStart, "开始")
+	if err != nil {
+		return nil, err
+	}
+	if err := s.nodeRepo.Create(ctx, startNode); err != nil {
+		return nil, err
+	}
 	resp := dto.ToTemplateResponse(tpl)
 	return &resp, nil
 }

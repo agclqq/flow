@@ -108,6 +108,9 @@ func (r *memVersionRepo) GetLatestPublishedByTemplate(context.Context, int64) (*
 func (r *memVersionRepo) ListByTemplate(context.Context, int64) ([]*entity.FlowTemplateVersion, error) {
 	return nil, nil
 }
+func (r *memVersionRepo) ListPublishedCronTriggers(context.Context) ([]entity.PublishedCronRule, error) {
+	return nil, nil
+}
 func (r *memVersionRepo) Update(context.Context, *entity.FlowTemplateVersion) error { return nil }
 
 func buildParallelJoinPipeline() *entity.FlowTemplateVersion {
@@ -177,7 +180,7 @@ func TestSchedulerParallelJoinPipeline(t *testing.T) {
 	instRepo := newMemInstRepo()
 	versionRepo := &memVersionRepo{versions: map[int64]*entity.FlowTemplateVersion{1: ver}}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	scheduler := NewScheduler(executor.NewLocalExecutor(), nil, instRepo, versionRepo, logger)
+	scheduler := NewScheduler(executor.NewLocalExecutor(), nil, instRepo, versionRepo, logger, "")
 
 	inst, err := entity.NewFlowInstance(1, 1, 1, valueobject.TriggerTypeManual)
 	require.NoError(t, err)
@@ -221,7 +224,7 @@ func TestSchedulerEndNodeMarksInstanceSucceeded(t *testing.T) {
 
 	instRepo := newMemInstRepo()
 	versionRepo := &memVersionRepo{versions: map[int64]*entity.FlowTemplateVersion{1: ver}}
-	scheduler := NewScheduler(executor.NewLocalExecutor(), nil, instRepo, versionRepo, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	scheduler := NewScheduler(executor.NewLocalExecutor(), nil, instRepo, versionRepo, slog.New(slog.NewTextHandler(io.Discard, nil)), "")
 
 	inst, err := entity.NewFlowInstance(1, 1, 1, valueobject.TriggerTypeManual)
 	require.NoError(t, err)

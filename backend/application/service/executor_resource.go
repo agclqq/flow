@@ -23,12 +23,13 @@ var secretFieldsByType = map[string][]string{
 
 // ExecutorResourceService 管理节点执行资源（在哪里执行）。
 type ExecutorResourceService struct {
-	repo repository.ExecutorResourceRepository
+	repo    repository.ExecutorResourceRepository
+	k8sRepo repository.K8sConfigRepository
 }
 
 // NewExecutorResourceService 构造执行资源服务。
-func NewExecutorResourceService(repo repository.ExecutorResourceRepository) *ExecutorResourceService {
-	return &ExecutorResourceService{repo: repo}
+func NewExecutorResourceService(repo repository.ExecutorResourceRepository, k8sRepo repository.K8sConfigRepository) *ExecutorResourceService {
+	return &ExecutorResourceService{repo: repo, k8sRepo: k8sRepo}
 }
 
 // List 列出全部执行资源；敏感字段以掩码返回。
@@ -166,6 +167,40 @@ func mergeResourceConfig(typ, oldConfig, newConfig string) string {
 		return newConfig
 	}
 	return string(data)
+}
+
+// ResolveNodeExecutor 根据节点运行时配置构造执行器。
+func (s *ExecutorResourceService) ResolveNodeExecutor(ctx context.Context, n *entity.Node) (executor.Executor, error) {
+	switch n.RuntimeKind {
+	case "", executor.RuntimeKindLocal:
+		return executor.NewRuntime(executor.RuntimeKindLocal, nil)
+	case executor.RuntimeKindSSH:
+		return s.resolveRuntime(ctx, n.RuntimeKind, n.ResourceID)
+	case executor.RuntimeKindK8s:
+		if n.K8sAuthID > 0 {
+			if s.k8sRepo == nil {
+				return nil, fmt.Errorf("k8s config repository is not configured")
+			}
+			auth, err := s.k8sRepo.GetByID(ctx, n.K8sAuthID)
+			if err != nil {
+				return nil, fmt.Errorf("load k8s auth %d: %w", n.K8sAuthID, err)
+			}
+			ns := n.K8sNamespace
+			if ns == "" {
+				ns = auth.Namespace
+			}
+			cfg := executor.K8sConfig{
+				Kubeconfig: auth.Kubeconfig,
+				Server:     auth.Server,
+				Token:      auth.Token,
+				Namespace:  ns,
+			}
+			return executor.NewK8sExecutor(cfg)
+		}
+		return s.resolveRuntime(ctx, executor.RuntimeKindK8s, n.ResourceID)
+	default:
+		return nil, errors.New("unknown runtime kind: " + n.RuntimeKind)
+	}
 }
 
 // resolveRuntime 根据节点的运行时类型与资源 ID 构造执行器。
